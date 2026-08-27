@@ -149,6 +149,25 @@ def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
         )
 
 
+def test_locked_h2_is_not_vulnerable_to_cve_2026_71554():
+    """The committed uv.lock must resolve h2 to the patched 4.4.1 floor."""
+    lock = (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+    versions = []
+    in_h2 = False
+    for line in lock.splitlines():
+        if line.startswith("[[package]]"):
+            in_h2 = False
+        elif line.strip() == 'name = "h2"':
+            in_h2 = True
+        elif in_h2 and line.startswith("version = "):
+            versions.append(line.split("=", 1)[1].strip().strip('"'))
+            in_h2 = False
+
+    assert versions, "h2 not found in uv.lock"
+    for version in versions:
+        assert _version_tuple(version) >= (4, 4, 1), (
+            f"uv.lock resolves h2=={version}, below the CVE-2026-71554 fix floor 4.4.1"
+        )
 
 
 # ---------------------------------------------------------------------------
