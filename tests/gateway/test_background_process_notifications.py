@@ -531,8 +531,14 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, origin_profile):
+        posts.append(
+            {
+                "text": text,
+                "session_id": session_id,
+                "origin_profile": origin_profile,
+            }
+        )
 
     import gateway.wake as wake_mod
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
@@ -546,7 +552,11 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
     assert result is True
     api_adapter.handle_message.assert_not_awaited()
     assert posts == [
-        {"text": "[SYSTEM: subagent finished]", "session_id": "raw-hq-session-id"}
+        {
+            "text": "[SYSTEM: subagent finished]",
+            "session_id": "raw-hq-session-id",
+            "origin_profile": "default",
+        }
     ]
 
 
@@ -564,8 +574,8 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append(session_id)
+    async def fake_self_post(adapter, *, text, session_id, origin_profile):
+        posts.append({"session_id": session_id, "origin_profile": origin_profile})
 
     import gateway.wake as wake_mod
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
@@ -577,7 +587,9 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     }
     result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
     assert result is True
-    assert posts == ["raw-origin-sid"]
+    assert posts == [
+        {"session_id": "raw-origin-sid", "origin_profile": "default"}
+    ]
 
 
 def test_gateway_drain_retains_and_formats_overflow_events():

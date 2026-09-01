@@ -138,6 +138,12 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.durable_delivery import (
+    DURABLE_DELIVERY_FIELD,
+    DURABLE_DELIVERY_HEADER,
+    find_durable_admission,
+    validate_durable_delivery_ids,
+)
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -1916,6 +1922,52 @@ class APIServerAdapter(BasePlatformAdapter):
                 type(exc).__name__,
             )
             return ""
+
+    def resolve_durable_wake_route(self, profile: str) -> tuple[str, str]:
+        """Resolve one authenticated local wake route without URL trust."""
+        from urllib.parse import quote
+
+        from gateway.durable_delivery import validate_origin_profile
+        from hermes_cli.profiles import profiles_to_serve
+
+        profile = validate_origin_profile(profile)
+        if profile == "default":
+            return "/v1/chat/completions", self._api_key
+
+        runner = getattr(self, "gateway_runner", None)
+        cfg = getattr(runner, "config", None)
+        if cfg is None:
+            raise ValueError(f"origin profile {profile!r} is not served")
+        multiplex = bool(getattr(cfg, "multiplex_profiles", False))
+        served = {
+            name
+            for name, _home in profiles_to_serve(
+                multiplex=multiplex,
+                profile_allowlist=(
+                    getattr(cfg, "multiplex_profile_allowlist", None)
+                    if multiplex
+                    else None
+                ),
+            )
+        }
+        if profile not in served:
+            raise ValueError(f"origin profile {profile!r} is not served")
+
+        if multiplex:
+            token = _api_request_profile.set(profile)
+            try:
+                with self._profile_scope(profile):
+                    api_key = self._expected_api_key()
+            finally:
+                _api_request_profile.reset(token)
+        else:
+            api_key = self._api_key
+        if not api_key:
+            raise RuntimeError(
+                f"origin profile {profile!r} has no usable API_SERVER_KEY"
+            )
+        encoded = quote(profile, safe="")
+        return f"/p/{encoded}/v1/chat/completions", api_key
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
@@ -5052,6 +5104,27 @@ class APIServerAdapter(BasePlatformAdapter):
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
+        durable_header = request.headers.get(DURABLE_DELIVERY_HEADER, "")
+        durable_field = body.get(DURABLE_DELIVERY_FIELD)
+        durable_delivery_ids: list[str] = []
+        if durable_header or durable_field is not None:
+            if not self._expected_api_key():
+                return web.json_response(
+                    _openai_error(
+                        "Internal durable delivery requires API key authentication"
+                    ),
+                    status=403,
+                )
+            try:
+                durable_delivery_ids = validate_durable_delivery_ids(durable_field)
+            except ValueError as exc:
+                return web.json_response(_openai_error(str(exc)), status=400)
+            if not durable_delivery_ids or durable_header != durable_delivery_ids[0]:
+                return web.json_response(
+                    _openai_error("Durable delivery header/body identity mismatch"),
+                    status=400,
+                )
+
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
             return web.json_response(
@@ -5270,6 +5343,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                durable_delivery_ids=durable_delivery_ids,
                 **agent_overrides,
                 route=route,
             ))
@@ -5291,6 +5365,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                durable_delivery_ids=durable_delivery_ids,
                 **agent_overrides,
                 route=route,
             )
@@ -5299,7 +5374,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if idempotency_key:
             fp = _make_request_fingerprint(
                 body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                keys=[
+                    "model", "provider", "model_options", "messages", "tools",
+                    "tool_choice", "stream", DURABLE_DELIVERY_FIELD,
+                ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
@@ -5384,14 +5462,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        response_data["hermes"] = {
+            "completed": completed,
+            "partial": is_partial,
+            "failed": is_failed,
+            "error": err_msg,
+            "error_code": (
+                "output_truncated"
+                if finish_reason == "length"
+                else "agent_error" if is_failed or not completed else None
+            ),
+        }
         if is_partial or is_failed or not completed:
-            response_data["hermes"] = {
-                "completed": completed,
-                "partial": is_partial,
-                "failed": is_failed,
-                "error": err_msg,
-                "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
-            }
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
             if err_msg:
@@ -7240,6 +7322,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        durable_delivery_ids: Optional[List[str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7270,6 +7353,59 @@ class APIServerAdapter(BasePlatformAdapter):
         ``_active_run_agents`` while the turn is running so API clients can
         call run-scoped control endpoints such as ``/v1/runs/{run_id}/steer``.
         """
+        durable_delivery_ids = validate_durable_delivery_ids(
+            durable_delivery_ids or []
+        )
+        resume_admitted_turn = False
+        if durable_delivery_ids:
+            admission_index, terminal = find_durable_admission(
+                conversation_history, durable_delivery_ids
+            )
+            if terminal is not None:
+                content = terminal.get("content")
+                return (
+                    {
+                        "final_response": content if isinstance(content, str) else "",
+                        "messages": conversation_history,
+                        "api_calls": 0,
+                        "completed": True,
+                        "history_offset": len(conversation_history),
+                        "session_id": session_id,
+                        "durable_delivery_replayed": True,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+            resume_admitted_turn = admission_index is not None
+            if admission_index is not None and any(
+                isinstance(item, dict) and item.get("role") == "user"
+                for item in conversation_history[admission_index + 1 :]
+            ):
+                logger.error(
+                    "Refusing API durable replay %s for session %s after a later "
+                    "user boundary",
+                    durable_delivery_ids,
+                    session_id,
+                )
+                return (
+                    {
+                        "final_response": (
+                            "⚠️ Durable turn recovery was quarantined because "
+                            "newer transcript rows already exist. Retry after "
+                            "operator review or use /reset."
+                        ),
+                        "messages": conversation_history,
+                        "api_calls": 0,
+                        "completed": False,
+                        "failed": True,
+                        "error": "durable_turn_conflict",
+                        "retryable": True,
+                        "durable_turn_conflict": True,
+                        "history_offset": len(conversation_history),
+                        "session_id": session_id,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
         # run_in_executor threads, so the profile scope must be re-entered
@@ -7330,11 +7466,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    conversation_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if durable_delivery_ids:
+                        conversation_kwargs["durable_delivery_ids"] = durable_delivery_ids
+                        conversation_kwargs["resume_admitted_turn"] = resume_admitted_turn
+                    result = agent.run_conversation(**conversation_kwargs)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

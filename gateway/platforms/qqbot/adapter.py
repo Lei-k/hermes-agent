@@ -63,6 +63,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    MessageDispatchStatus,
     MessageEvent,
     MessageType,
     SendResult,
@@ -954,11 +955,13 @@ class QQAdapter(BasePlatformAdapter):
     # Inbound message handling
     # ------------------------------------------------------------------
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def handle_message(
+        self, event: MessageEvent,
+    ) -> Optional[MessageDispatchStatus]:
         """Cache the last message ID per chat, then delegate to base."""
         if event.message_id and event.source.chat_id:
             self._last_msg_id[event.source.chat_id] = event.message_id
-        await super().handle_message(event)
+        return await super().handle_message(event)
 
     async def _on_message(self, event_type: str, d: Any) -> None:
         """Process an inbound QQ Bot message event."""

@@ -29,6 +29,12 @@ import asyncio
 import logging
 from typing import Any, Optional
 
+from gateway.durable_delivery import (
+    DURABLE_DELIVERY_FIELD,
+    DURABLE_DELIVERY_HEADER,
+    validate_durable_delivery_ids,
+)
+
 logger = logging.getLogger(__name__)
 
 # A wake self-post runs the entire agent turn synchronously (stream=false);
@@ -59,6 +65,8 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    durable_delivery_ids: Optional[list[str]] = None,
+    origin_profile: str = "default",
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -70,6 +78,9 @@ async def deliver_wake(
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
     """
+    validated_delivery_ids = validate_durable_delivery_ids(
+        durable_delivery_ids or []
+    )
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError(
@@ -82,8 +93,17 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            metadata=(
+                {"hermes_completion_delivery_ids": validated_delivery_ids}
+                if validated_delivery_ids else {}
+            ),
+            requires_durable_acceptance=bool(validated_delivery_ids),
         )
-        await adapter.handle_message(synth_event)
+        durable_dispatch = getattr(adapter, "dispatch_durable_message", None)
+        if validated_delivery_ids and callable(durable_dispatch):
+            await durable_dispatch(synth_event)
+        else:
+            await adapter.handle_message(synth_event)
         return
 
     if not session_id:
@@ -91,11 +111,23 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    self_post_kwargs = {
+        "text": text,
+        "session_id": session_id,
+        "origin_profile": origin_profile,
+    }
+    if validated_delivery_ids:
+        self_post_kwargs["durable_delivery_ids"] = validated_delivery_ids
+    await _self_post_chat_completion(adapter, **self_post_kwargs)
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any,
+    *,
+    text: str,
+    session_id: str,
+    durable_delivery_ids: Optional[list[str]] = None,
+    origin_profile: str = "default",
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -112,7 +144,16 @@ async def _self_post_chat_completion(
         # Wildcard bind address — connect over loopback.
         host = "127.0.0.1"
     port = int(getattr(adapter, "_port", 0) or 8642)
-    api_key = str(getattr(adapter, "_api_key", "") or "")
+    resolve_route = getattr(adapter, "resolve_durable_wake_route", None)
+    if callable(resolve_route):
+        route_path, api_key = resolve_route(origin_profile)
+    elif origin_profile == "default":
+        route_path = "/v1/chat/completions"
+        api_key = str(getattr(adapter, "_api_key", "") or "")
+    else:
+        raise RuntimeError(
+            "wake self-post adapter cannot validate a named origin profile"
+        )
     if not api_key:
         raise RuntimeError(
             "wake self-post requires API_SERVER_KEY: session continuation via "
@@ -122,16 +163,25 @@ async def _self_post_chat_completion(
 
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    url = f"http://{host}:{port}{route_path}"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
     }
+    validated_delivery_ids = validate_durable_delivery_ids(
+        durable_delivery_ids or []
+    )
+    if validated_delivery_ids:
+        primary_delivery_id = validated_delivery_ids[0]
+        headers["Idempotency-Key"] = primary_delivery_id
+        headers[DURABLE_DELIVERY_HEADER] = primary_delivery_id
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
         "messages": [{"role": "user", "content": text}],
         "stream": False,
     }
+    if validated_delivery_ids:
+        payload[DURABLE_DELIVERY_FIELD] = validated_delivery_ids
 
     last_err: Optional[BaseException] = None
     attempts = 1 + len(_RETRY_DELAYS_SECONDS)
@@ -160,7 +210,23 @@ async def _self_post_chat_completion(
                             f"wake self-post failed for session {session_id}: "
                             f"HTTP {resp.status}: {body}"
                         )
-                    await resp.read()
+                    response_body = await resp.json(content_type=None)
+                    hermes_status = (
+                        response_body.get("hermes", {})
+                        if isinstance(response_body, dict) else {}
+                    )
+                    if not (
+                        hermes_status.get("completed") is True
+                        and hermes_status.get("failed") is not True
+                        and hermes_status.get("partial") is not True
+                    ):
+                        last_err = RuntimeError(
+                            f"wake self-post returned an incomplete turn for session {session_id}"
+                        )
+                        logger.warning(
+                            "%s; attempt %d/%d", last_err, attempt + 1, attempts
+                        )
+                        continue
                     logger.info(
                         "wake self-post delivered for session %s (attempt %d)",
                         session_id,

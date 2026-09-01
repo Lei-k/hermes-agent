@@ -169,6 +169,50 @@ class TestQueueConsumptionAfterCompletion:
         # gets the next-in-line item.
         assert adapter._pending_messages[session_key].text == "Q2"
 
+    def test_recursion_cap_requeues_mixed_events_without_identity_loss(self):
+        """The current event stays ahead of the promoted sibling at the cap."""
+        from gateway.run import GatewayRunner
+
+        for current_is_completion in (False, True):
+            runner = GatewayRunner.__new__(GatewayRunner)
+            runner._queued_events = {}
+            adapter = _StubAdapter()
+            session_key = "telegram:user:mixed-cap"
+            source = MagicMock()
+            user = MessageEvent(
+                text="user",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id="user-id",
+                internal=False,
+            )
+            completion = MessageEvent(
+                text="completion",
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+                allow_gateway_control=False,
+                metadata={"hermes_completion_delivery_id": "async-delegation:d-cap"},
+                requires_durable_acceptance=True,
+            )
+            current, sibling = (
+                (completion, user) if current_is_completion else (user, completion)
+            )
+            runner._session_state(session_key).conversation.queued_events.append(sibling)
+
+            promoted_current = runner._promote_queued_event(
+                session_key, adapter, current
+            )
+            runner._requeue_recursion_cap_event(
+                session_key, adapter, promoted_current
+            )
+
+            head = adapter._pending_messages[session_key]
+            tail = runner._session_state(session_key).conversation.queued_events
+            assert [head, *tail] == [current, sibling]
+            assert head.internal is current_is_completion
+            assert tail[0].internal is not current_is_completion
+
 
 class TestBusyInputModeQueueFifo:
     """Regression coverage for issue #28503.

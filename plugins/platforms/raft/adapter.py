@@ -41,6 +41,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    MessageDispatchStatus,
     MessageEvent,
     MessageType,
     SendResult,
@@ -734,8 +735,12 @@ class RaftAdapter(BasePlatformAdapter):
             return False
         return True
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def handle_message(
+        self, event: MessageEvent,
+    ) -> Optional[MessageDispatchStatus]:
         """Accept Raft wake hints without interrupting an active Hermes turn."""
+        if event.requires_durable_acceptance:
+            return await super().handle_message(event)
         if not self._message_handler:
             return
 
@@ -751,7 +756,7 @@ class RaftAdapter(BasePlatformAdapter):
             merge_pending_message_event(self._pending_messages, session_key, event)
             return
 
-        await super().handle_message(event)
+        return await super().handle_message(event)
 
     @staticmethod
     def _wake_prompt() -> str:

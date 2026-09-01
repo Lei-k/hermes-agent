@@ -45,7 +45,10 @@ from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import TYPE_CHECKING, Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+
+if TYPE_CHECKING:
+    from agent.session_activity import ActivityProvenance
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -2768,12 +2771,15 @@ from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    MessageDispatchStatus,
     MessageEvent,
     MessageType,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
+    mark_message_consumed,
     merge_pending_message_event,
+    resolve_message_acceptance,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -2808,6 +2814,17 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# Internal delivery result: the target session is healthy but currently owns a
+# foreground turn, so retry later without charging the failure budget.
+class _CompletionDeliveryDeferred:
+    pass
+
+
+_COMPLETION_DELIVERY_DEFERRED = _CompletionDeliveryDeferred()
+_CompletionDeliveryResult = Optional[Union[bool, _CompletionDeliveryDeferred]]
+_MAX_ASYNC_DELEGATION_DELIVERIES = 32
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -4256,30 +4273,43 @@ def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
 
 
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
-    """Return True only when a gateway turn really completed successfully.
+    """Return True only when a gateway turn has terminal completion proof.
 
     Restart recovery uses ``resume_pending`` as a durable marker for sessions
     interrupted during gateway drain.  A soft interrupt can still bubble out as
     a syntactically normal agent result with an empty final response; clearing
     the marker in that case loses the recovery signal and startup auto-resume
-    has nothing to schedule.
+    has nothing to schedule. A transcript-linked durable replay is the narrow
+    exception: its intentionally blank response means the D,T rows were already
+    committed, not that the turn is incomplete.
     """
     if not isinstance(agent_result, dict):
         return False
+    if (
+        agent_result.get("completed") is True
+        and agent_result.get("durable_delivery_replayed") is True
+    ):
+        return True
+    if agent_result.get("durable_parent_terminal_proof") is True:
+        # The returned result belongs to a recursively drained follow-up, but
+        # that unrelated result cannot revoke the terminal durable parent.
+        return True
     if agent_result.get("interrupted"):
         return False
     if agent_result.get("failed") or agent_result.get("partial") or agent_result.get("error"):
         return False
     if agent_result.get("completed") is False:
         return False
-    return True
+    return bool(str(agent_result.get("final_response") or "").strip())
 
 
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
+    *,
+    preserve_durable_parent_terminal_proof: bool = False,
 ) -> dict:
-    """Carry the outer history offset through queued follow-up drains.
+    """Preserve outer persistence and durable-proof state across a drain.
 
     ``_process_message_background()`` persists transcript rows only once, after the
     entire in-band queued-follow-up chain returns.  Each recursive ``_run_agent()``
@@ -4288,7 +4318,10 @@ def _preserve_queued_followup_history_offset(
     "new" and silently drops earlier turns from the same drain chain.
 
     Preserve the earliest (outermost) history offset so the final transcript slice
-    still includes every queued turn that ran during the chain.
+    still includes every queued turn that ran during the chain. When the outer
+    turn is a durable delivery with terminal proof, carry that proof separately:
+    the returned response and failure fields still belong to the drained user
+    turn, but they must not reject the durable parent's receipt.
     """
     if not isinstance(followup_result, dict):
         return followup_result
@@ -4297,14 +4330,30 @@ def _preserve_queued_followup_history_offset(
 
     current_offset = current_result.get("history_offset")
     followup_offset = followup_result.get("history_offset")
-    if not isinstance(current_offset, int):
-        return followup_result
-    if isinstance(followup_offset, int) and followup_offset <= current_offset:
-        return followup_result
-
     merged = dict(followup_result)
-    merged["history_offset"] = current_offset
+    if preserve_durable_parent_terminal_proof:
+        merged["durable_parent_terminal_proof"] = True
+    if isinstance(current_offset, int) and not (
+        isinstance(followup_offset, int) and followup_offset <= current_offset
+    ):
+        merged["history_offset"] = current_offset
     return merged
+
+
+def _merge_queued_followup_result(
+    durable_parent_result: dict,
+    followup_result: dict,
+    durable_delivery_ids: List[str] | None,
+) -> dict:
+    """Return the drained turn while retaining terminal proof for durable ACK."""
+    return _preserve_queued_followup_history_offset(
+        durable_parent_result,
+        followup_result,
+        preserve_durable_parent_terminal_proof=(
+            bool(durable_delivery_ids)
+            and _should_clear_resume_pending_after_turn(durable_parent_result)
+        ),
+    )
 
 
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:
@@ -6662,6 +6711,9 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.durable_delivery_ids:
+                _conversation_kwargs["durable_delivery_ids"] = ctx.durable_delivery_ids
+                _conversation_kwargs["resume_admitted_turn"] = ctx.resume_admitted_turn
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -9362,6 +9414,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             overflow.insert(0, next_queued)
         return pending_event
 
+    def _requeue_recursion_cap_event(
+        self,
+        session_key: str,
+        adapter: Any,
+        current_event: "MessageEvent",
+    ) -> None:
+        """Restore the capped event ahead of the sibling already promoted."""
+        staged = adapter._pending_messages.pop(session_key, None)
+        adapter._pending_messages[session_key] = current_event
+        if staged is not None and staged is not current_event:
+            self._session_state(session_key).conversation.queued_events.insert(
+                0, staged
+            )
+
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
         _q_state = self._peek_session_state(session_key)
@@ -10397,10 +10463,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -10441,7 +10507,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -10449,9 +10515,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -10491,6 +10558,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return (enriched_text or text).strip()
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Durable internal completions have already passed the watcher's routing
+        # and ownership checks; they are not new user input. Admit them before
+        # user authorization/drain policy so a changed allowlist cannot produce
+        # a handled-but-unqueued false acceptance receipt.
+        if event.internal and event.requires_durable_acceptance:
+            adapter = self._adapter_for_source(event.source)
+            flush_debounce = getattr(adapter, "_flush_text_debounce_now", None)
+            if callable(flush_debounce):
+                await flush_debounce(session_key)
+            return self._queue_or_replace_pending_event(session_key, event)
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -19801,6 +19879,114 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _fence_unfinished_durable_turn(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        history: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Keep later turns behind an append-only durable admission."""
+        from gateway.durable_delivery import (
+            UNFINISHED_DURABLE_CONFLICT,
+            UNFINISHED_DURABLE_OPEN_TAIL,
+            classify_unfinished_durable_turn,
+            validate_durable_delivery_ids,
+        )
+
+        state, admitted_ids, _admission_index = classify_unfinished_durable_turn(
+            history
+        )
+        if state not in {
+            UNFINISHED_DURABLE_OPEN_TAIL,
+            UNFINISHED_DURABLE_CONFLICT,
+        }:
+            return None
+
+        metadata = getattr(event, "metadata", None) or {}
+        raw_event_ids = metadata.get("hermes_completion_delivery_ids") or []
+        if not raw_event_ids and metadata.get("hermes_completion_delivery_id"):
+            raw_event_ids = [metadata["hermes_completion_delivery_id"]]
+        try:
+            event_ids = validate_durable_delivery_ids(raw_event_ids)
+        except ValueError:
+            event_ids = []
+
+        if (
+            state == UNFINISHED_DURABLE_OPEN_TAIL
+            and set(event_ids).intersection(admitted_ids)
+        ):
+            return None
+
+        if getattr(event, "requires_durable_acceptance", False):
+            # The durable producer remains authoritative and will retry from its
+            # ledger. Never leave a second durable copy in the in-memory queue.
+            setattr(event, "_hermes_durable_acceptance_deferred", True)
+
+        if state == UNFINISHED_DURABLE_CONFLICT:
+            logger.error(
+                "Quarantining session %s: unfinished durable admission %s has "
+                "a later user boundary",
+                session_key,
+                admitted_ids,
+            )
+            return (
+                "⚠️ This session has an unfinished durable turn followed by "
+                "newer transcript rows, so Hermes quarantined it rather than "
+                "reordering history. Please retry after an operator reviews "
+                "the session, or use /reset to start fresh."
+            )
+
+        if not event_ids:
+            # Keep the event in the adapter's normal pending store so shutdown
+            # spooling and FIFO semantics remain intact, but prevent generic
+            # drains from running it before durable terminal proof.
+            setattr(event, "_hermes_wait_for_durable_replay", True)
+            if self._queue_or_replace_pending_event(session_key, event):
+                logger.info(
+                    "Deferred message for %s until durable admission %s recovers",
+                    session_key,
+                    admitted_ids,
+                )
+                return (
+                    "⏳ An interrupted durable turn is being recovered first. "
+                    "Your message is queued and will run after recovery."
+                )
+            try:
+                delattr(event, "_hermes_wait_for_durable_replay")
+            except AttributeError:
+                pass
+
+        logger.warning(
+            "Could not queue event behind unfinished durable admission %s for %s",
+            admitted_ids,
+            session_key,
+        )
+        return (
+            "⏳ An interrupted durable turn must finish before this message can "
+            "run. Please retry shortly; this message was not added to history."
+        )
+
+    def _release_durable_fenced_events(
+        self, session_key: str, source: SessionSource
+    ) -> None:
+        """Allow parked follow-ups to drain after durable terminal proof."""
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return
+        pending = getattr(adapter, "_pending_messages", {}).get(session_key)
+        if pending is not None:
+            try:
+                delattr(pending, "_hermes_wait_for_durable_replay")
+            except AttributeError:
+                pass
+        state = self._peek_session_state(session_key)
+        queued = state.conversation.queued_events if state is not None else []
+        for queued_event in queued:
+            try:
+                delattr(queued_event, "_hermes_wait_for_durable_replay")
+            except AttributeError:
+                pass
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -20187,6 +20373,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
+
+        # Fence unfinished durable work after the lease + transcript load, but
+        # before hygiene or provider work. This preserves both the cached
+        # provider prefix and append-only SessionDB ordering across restart.
+        _durable_fence_result = self._fence_unfinished_durable_turn(
+            event, session_entry.session_key, history
+        )
+        if _durable_fence_result is not None:
+            # The broad cleanup finally starts below this early return.
+            self._clear_session_env(_session_env_tokens)
+            return _durable_fence_result
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -21358,7 +21555,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                durable_delivery_ids=(
+                    list(event.metadata.get("hermes_completion_delivery_ids") or [])
+                    or (
+                        [event.metadata["hermes_completion_delivery_id"]]
+                        if event.metadata.get("hermes_completion_delivery_id")
+                        else []
+                    )
+                ),
             )
+            if event.requires_durable_acceptance:
+                if _should_clear_resume_pending_after_turn(agent_result):
+                    self._release_durable_fenced_events(session_key, source)
+                else:
+                    # A proxy transport failure (including a response lost after
+                    # remote commit) has no terminal proof. Keep the durable row
+                    # replayable; the stable remote identity makes retry safe.
+                    setattr(event, "_hermes_durable_acceptance_deferred", True)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
@@ -26120,6 +26333,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from gateway.session import SessionSource
 
+        origin_profile = str(evt.get("origin_profile") or "default")
+
+        def _stamp_origin_profile(source):
+            import copy
+
+            stamped = copy.copy(source)
+            stamped.profile = origin_profile
+            return stamped
+
         session_key = str(evt.get("session_key") or "").strip()
         derived_platform = ""
         derived_chat_type = ""
@@ -26130,7 +26352,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    return _stamp_origin_profile(entry.origin)
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -26140,7 +26362,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return cached_source
+                return _stamp_origin_profile(cached_source)
 
             _parsed = _parse_session_key(session_key)
             if _parsed:
@@ -26203,6 +26425,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
             scope_id=scope_id,
+            profile=origin_profile,
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
@@ -26227,7 +26450,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
-    ) -> Optional[bool]:
+    ) -> _CompletionDeliveryResult:
         """Inject a watch/completion notification as a synthetic message event.
 
         Routing must come from the queued event itself, not from whatever
@@ -26237,6 +26460,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        from gateway.durable_delivery import (
+            durable_delivery_ids_for_event,
+            validate_origin_profile,
+        )
+
+        try:
+            durable_delivery_ids = durable_delivery_ids_for_event(evt)
+        except ValueError:
+            logger.warning("Rejecting completion with invalid durable identity")
+            return False
+        origin_profile = "default"
+        if durable_delivery_ids:
+            try:
+                origin_profile = validate_origin_profile(evt.get("origin_profile"))
+                config = getattr(self, "config", None)
+                if config is None:
+                    # Minimal/legacy runners have always represented the default
+                    # profile. Named origins still fail closed without a serving
+                    # configuration.
+                    served_profiles = {"default"}
+                elif getattr(config, "multiplex_profiles", False):
+                    served_profiles = {
+                        name for name, _home in _multiplex_profile_homes(config)
+                    }
+                else:
+                    from hermes_cli.profiles import get_active_profile_name
+
+                    served_profiles = {get_active_profile_name() or "default"}
+                if origin_profile not in served_profiles:
+                    raise ValueError("profile is not served")
+            except Exception:
+                logger.warning(
+                    "Rejecting durable completion with invalid or unserved "
+                    "origin profile %r",
+                    evt.get("origin_profile"),
+                )
+                return False
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
@@ -26261,7 +26521,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            durable_delivery_ids=durable_delivery_ids,
+                            origin_profile=origin_profile,
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -26328,7 +26594,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    durable_delivery_ids=durable_delivery_ids,
+                    origin_profile=origin_profile,
+                )
                 return True
             except Exception as e:
                 logger.warning(
@@ -26342,14 +26614,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            durable_delivery_id = durable_delivery_ids[0] if durable_delivery_ids else ""
+            if evt.get("type") == "async_delegation":
+                delegation_id = str(evt.get("delegation_id") or "").strip()
+                if delegation_id:
+                    metadata["hermes_completion_delivery_id"] = durable_delivery_id
+                coalesced_ids = [
+                    str(value).strip()
+                    for value in evt.get("_coalesced_delegation_ids", [])
+                    if str(value).strip()
+                ]
+                if coalesced_ids:
+                    metadata["hermes_completion_delivery_ids"] = durable_delivery_ids
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                allow_gateway_control=False,
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata=metadata,
+                requires_durable_acceptance=evt.get("type") == "async_delegation",
             )
+            acceptance_receipt = None
+            if synth_event.requires_durable_acceptance:
+                acceptance_receipt = asyncio.get_running_loop().create_future()
+                setattr(
+                    synth_event,
+                    "_hermes_durable_acceptance_receipt",
+                    acceptance_receipt,
+                )
+                delegation_ids = coalesced_ids or (
+                    [delegation_id] if delegation_id else []
+                )
+
+                def _mark_consumed() -> bool:
+                    from tools.async_delegation import (
+                        get_durable_delegation,
+                        mark_completion_delivery_consumed,
+                    )
+
+                    return all(
+                        get_durable_delegation(value) is None
+                        or mark_completion_delivery_consumed(value)
+                        for value in delegation_ids
+                    )
+
+                setattr(
+                    synth_event,
+                    "_hermes_mark_durable_consumed",
+                    _mark_consumed,
+                )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
@@ -26365,7 +26680,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _prime = getattr(adapter, "prime_routing_cache", None)
             if callable(_prime):
                 _prime(synth_event)
-            await adapter.handle_message(synth_event)
+            durable_dispatch = getattr(adapter, "dispatch_durable_message", None)
+            if synth_event.requires_durable_acceptance and callable(durable_dispatch):
+                dispatch = await durable_dispatch(synth_event)
+            else:
+                dispatch = await adapter.handle_message(synth_event)
+            if dispatch is MessageDispatchStatus.DEFERRED:
+                return _COMPLETION_DELIVERY_DEFERRED
+            if dispatch is MessageDispatchStatus.REJECTED:
+                return False
+            if (
+                dispatch is MessageDispatchStatus.ACCEPTED
+                and acceptance_receipt is not None
+            ):
+                timeout = float(
+                    getattr(self, "_durable_acceptance_timeout_seconds", 30.0)
+                )
+                timeout = max(timeout, 0.001)
+                try:
+                    while not acceptance_receipt.done():
+                        done, _pending = await asyncio.wait(
+                            {acceptance_receipt}, timeout=timeout
+                        )
+                        if done:
+                            break
+                        setattr(synth_event, "_hermes_durable_acceptance_expired", True)
+                        owner_task = getattr(
+                            synth_event, "_hermes_durable_owner_task", None
+                        )
+                        if not isinstance(owner_task, asyncio.Task) or owner_task.done():
+                            setattr(
+                                synth_event,
+                                "_hermes_durable_acceptance_deferred",
+                                True,
+                            )
+                            logger.warning(
+                                "Durable completion receipt timed out after %.3fs "
+                                "without a live base-owned task; deferring",
+                                timeout,
+                            )
+                            return _COMPLETION_DELIVERY_DEFERRED
+                        logger.warning(
+                            "Durable completion still live after %.3fs; retaining "
+                            "its owner and claim until the receipt resolves",
+                            timeout,
+                        )
+                    accepted = bool(acceptance_receipt.result())
+                except asyncio.CancelledError:
+                    cancel_dispatch = getattr(
+                        adapter, "cancel_durable_message", None
+                    )
+                    if callable(cancel_dispatch):
+                        await cancel_dispatch(synth_event)
+                    raise
+                if (
+                    not accepted
+                    and getattr(
+                        synth_event,
+                        "_hermes_durable_acceptance_deferred",
+                        False,
+                    )
+                ):
+                    return _COMPLETION_DELIVERY_DEFERRED
+                return accepted
+            if synth_event.requires_durable_acceptance:
+                # Every adapter must opt into the explicit durable status and
+                # receipt protocol. Treating a bare None as acceptance would
+                # recreate the false-delivered state this seam prevents.
+                return False
+            # Compatibility for adapter test doubles and third-party adapters
+            # that predate MessageDispatchStatus: no exception still means an
+            # immediate accepted handoff, matching the historical contract.
             return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
@@ -26461,24 +26846,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
-    ) -> Optional[bool]:
+    ) -> _CompletionDeliveryResult:
         """Deliver once per live gateway, or return False for a retry.
 
-        ``True`` means this caller reached adapter acceptance, ``False`` means
-        injection failed and the claim was released for retry, and ``None``
-        means either another same-lifecycle caller owns/delivered the producer
-        event or the event has no gateway route. No cross-process exactly-once
-        guarantee is claimed.
+        ``True`` means this caller reached durable adapter acceptance, ``False``
+        means injection failed and the claim was released for retry,
+        ``_COMPLETION_DELIVERY_DEFERRED`` means healthy busy-session backpressure,
+        and ``None`` means another same-lifecycle caller owns/delivered the
+        producer event or the event has no gateway route. Cross-process claims
+        prevent concurrent acceptance; crash recovery remains replayable.
         """
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
+        durable_record_exists = False
+        durable_was_consumed = False
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import (
+                        claim_completion_delivery,
+                        get_durable_delegation,
+                    )
 
+                    durable_record = get_durable_delegation(durable_delegation_id)
+                    durable_record_exists = durable_record is not None
+                    durable_was_consumed = bool(
+                        durable_record and durable_record.get("consumed_at")
+                    )
                     durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
                     if not claim_completion_delivery(
                         durable_delegation_id, durable_claim_id,
@@ -26559,6 +26955,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # re-poll and try again rather than dropping or
                     # misrouting the result.
                     return False
+        if durable_was_consumed and durable_claim_id:
+            from tools.async_delegation import complete_completion_delivery
+
+            if complete_completion_delivery(
+                durable_delegation_id, durable_claim_id
+            ):
+                durable_claim_id = ""
+                if identity is not None:
+                    with self._completion_delivery_lock:
+                        self._completion_deliveries_delivered[identity] = None
+                        while (
+                            len(self._completion_deliveries_delivered)
+                            > self._completion_delivery_retention
+                        ):
+                            self._completion_deliveries_delivered.popitem(last=False)
+                return True
+            return False
         if identity is not None:
             with self._completion_delivery_lock:
                 if (
@@ -26571,10 +26984,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         accepted = False
         try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
+            if injection_result is _COMPLETION_DELIVERY_DEFERRED:
+                if durable_claim_id:
+                    try:
+                        from tools.async_delegation import defer_completion_delivery
+
+                        if defer_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        ):
+                            durable_claim_id = ""
+                    except Exception:
+                        logger.debug(
+                            "Could not defer durable completion claim",
+                            exc_info=True,
+                        )
+                return _COMPLETION_DELIVERY_DEFERRED
             if injection_result is not True:
                 return injection_result
-            accepted = True
 
+            # The durable row remains authoritative while the event is busy or
+            # its own gateway turn is running. Acknowledge only after the base
+            # adapter's processing receipt confirms the handler returned. Do
+            # not publish lifecycle-local "delivered" state unless that durable
+            # compare-and-set succeeds; otherwise release and retry honestly.
+            if durable_claim_id:
+                try:
+                    from tools.async_delegation import complete_completion_delivery
+
+                    acknowledged = complete_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    )
+                    if durable_record_exists and not acknowledged:
+                        logger.warning(
+                            "Durable async completion %s was consumed but its "
+                            "delivery acknowledgement was rejected; retaining "
+                            "it for idempotent retry",
+                            durable_delegation_id,
+                        )
+                        return False
+                    durable_claim_id = ""
+                except Exception as exc:
+                    logger.warning(
+                        "Could not acknowledge durable async completion %s: %s",
+                        durable_delegation_id, exc,
+                    )
+                    if durable_record_exists:
+                        return False
+                    durable_claim_id = ""
+
+            accepted = True
             if identity is not None:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
@@ -26584,22 +27042,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         > self._completion_delivery_retention
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
-
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
-
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
             return True
         finally:
             if identity is not None and not accepted:
@@ -26625,6 +27067,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "chat_id",
             "thread_id",
             "user_id",
+            "origin_profile",
         ))
 
     @staticmethod
@@ -26706,8 +27149,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # fresh sibling is never discarded with that duplicate.
             delivered = None
             for _text, candidate_evt, _future in entries:
-                delivered = await self._deliver_completion_notification(
+                candidate_result = await self._deliver_completion_notification(
                     synth_text, candidate_evt,
+                )
+                delivered = (
+                    False
+                    if isinstance(candidate_result, _CompletionDeliveryDeferred)
+                    else candidate_result
                 )
                 if delivered is not None:
                     break
@@ -26843,6 +27291,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "chat_id",
             "thread_id",
             "user_id",
+            "origin_profile",
         ))
 
     @staticmethod
@@ -26859,7 +27308,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_async_delegation_group(
         self, group: list[dict],
-    ) -> Optional[bool]:
+    ) -> _CompletionDeliveryResult:
         """Deliver a same-session batch of async completions as ONE turn.
 
         A single-event group rides the existing per-event path unchanged. For
@@ -26873,8 +27322,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         by another consumer is excluded from the consolidated text entirely
         so its content cannot be double-delivered.
 
-        Returns ``True`` after adapter acceptance, ``False`` when the caller
-        should requeue the group for retry, and ``None`` when nothing in the
+        Returns ``True`` after durable adapter acceptance, ``False`` for a
+        charged delivery failure, ``_COMPLETION_DELIVERY_DEFERRED`` for
+        uncharged busy-session backpressure, and ``None`` when nothing in the
         group is deliverable by this runner (siblings that still need a retry
         are requeued here before returning).
         """
@@ -26897,6 +27347,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not deliverable:
             return None
+
+        # A consumed row is only waiting for its own durable ACK. It cannot be
+        # the carrier for fresh siblings: _deliver_completion_notification
+        # intentionally short-circuits consumed rows without adapter injection,
+        # so using one as the primary would falsely ACK every fresh sibling.
+        # Close consumed identities individually, then batch only rows that
+        # still require durable admission/consumption.
+        from tools.async_delegation import get_durable_delegation
+
+        fresh_deliverable: list[tuple[dict, str]] = []
+        consumed_acknowledged = False
+        for evt, synth_text in deliverable:
+            delegation_id = str(evt.get("delegation_id") or "")
+            record = (
+                get_durable_delegation(delegation_id)
+                if delegation_id
+                else None
+            )
+            if not (record and record.get("consumed_at")):
+                fresh_deliverable.append((evt, synth_text))
+                continue
+            result = await self._deliver_completion_notification(synth_text, evt)
+            if result is False or result is _COMPLETION_DELIVERY_DEFERRED:
+                return result
+            consumed_acknowledged = consumed_acknowledged or result is True
+
+        deliverable = fresh_deliverable
+        if not deliverable:
+            return True if consumed_acknowledged else None
         if len(deliverable) == 1:
             evt, synth_text = deliverable[0]
             return await self._deliver_completion_notification(synth_text, evt)
@@ -26904,6 +27383,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.async_delegation import (
             claim_event_delivery,
             complete_event_delivery,
+            defer_event_delivery,
             release_event_delivery,
         )
 
@@ -26925,24 +27405,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         consolidated = self._format_coalesced_async_delegations(blocks)
-        delivered: Optional[bool] = False
+        consolidated_event = dict(primary_evt)
+        consolidated_event["_coalesced_delegation_ids"] = [
+            str(evt.get("delegation_id") or "")
+            for evt, _claim_id in [(primary_evt, ""), *siblings]
+            if evt.get("delegation_id")
+        ]
+        delivered: _CompletionDeliveryResult = False
         try:
             delivered = await self._deliver_completion_notification(
-                consolidated, primary_evt,
+                consolidated, consolidated_event,
             )
         finally:
             if delivered is True:
+                sibling_ack_failed = False
+                acknowledged_siblings: list[dict] = []
                 for evt, claim_id in siblings:
                     try:
-                        complete_event_delivery(evt, claim_id)
+                        if not complete_event_delivery(evt, claim_id):
+                            raise RuntimeError("durable sibling acknowledgement rejected")
+                        acknowledged_siblings.append(evt)
                     except Exception:
+                        sibling_ack_failed = True
+                        try:
+                            release_event_delivery(evt, claim_id)
+                        except Exception:
+                            pass
                         logger.debug(
                             "Could not acknowledge coalesced durable completion",
                             exc_info=True,
                         )
-                self._record_coalesced_completion_siblings(
-                    [evt for evt, _claim_id in siblings]
-                )
+                if acknowledged_siblings:
+                    self._record_coalesced_completion_siblings(
+                        acknowledged_siblings
+                    )
+                if sibling_ack_failed:
+                    delivered = False
+            elif delivered is _COMPLETION_DELIVERY_DEFERRED:
+                # Busy-session admission is normal backpressure for the whole
+                # consolidated turn; return every sibling without charging its
+                # bounded failure budget.
+                for evt, claim_id in siblings:
+                    try:
+                        defer_event_delivery(evt, claim_id)
+                    except Exception:
+                        logger.debug(
+                            "Could not defer coalesced durable claim",
+                            exc_info=True,
+                        )
             else:
                 # Not delivered — release every sibling claim so a retry (or
                 # another consumer) can claim it, honestly leaving the durable
@@ -26962,6 +27472,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _pr.completion_queue.put(evt)
         return delivered
 
+    async def _run_async_delegation_group_delivery(
+        self,
+        group: list[dict],
+        completion_queue: Any,
+    ) -> None:
+        """Deliver one route group and restore retryable events to the queue."""
+        try:
+            delivered = await self._deliver_async_delegation_group(group)
+            if (
+                delivered is False
+                or delivered is _COMPLETION_DELIVERY_DEFERRED
+            ):
+                for evt in group:
+                    completion_queue.put(evt)
+        except asyncio.CancelledError:
+            # _deliver_async_delegation_group releases every live claim in its
+            # finally path. The durable rows, not this volatile queue, own
+            # crash/shutdown replay.
+            raise
+        except Exception as exc:
+            for evt in group:
+                completion_queue.put(evt)
+            logger.error("Async delegation injection error: %s", exc)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -26974,10 +27508,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
         queue has nothing for us; ignores non-async event types (those are
-        handled by ``_run_process_watcher`` / the post-turn drain).
+        handled by ``_run_process_watcher`` / the post-turn drain). Route groups
+        are delivered concurrently so one busy session's durable receipt cannot
+        head-of-line block unrelated completions. The task cap bounds ownership.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
+
+        delivery_tasks = getattr(self, "_async_delegation_delivery_tasks", None)
+        if not isinstance(delivery_tasks, dict):
+            delivery_tasks = {}
+            self._async_delegation_delivery_tasks = delivery_tasks
+
+        def _forget_delivery(key: tuple[str, ...], task: asyncio.Task) -> None:
+            if delivery_tasks.get(key) is task:
+                delivery_tasks.pop(key, None)
+            getattr(self, "_background_tasks", set()).discard(task)
+
         while self._running:
             try:
                 # Peek the queue for async-delegation events. We must NOT
@@ -27011,17 +27558,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         groups[key] = []
                         group_order.append(key)
                     groups[key].append(evt)
+
+                started: list[asyncio.Task] = []
                 for key in group_order:
                     group = groups[key]
-                    try:
-                        delivered = await self._deliver_async_delegation_group(group)
-                        if delivered is False:
-                            for evt in group:
-                                _pr.completion_queue.put(evt)
-                    except Exception as e:
+                    active_task = delivery_tasks.get(key)
+                    if active_task is not None and not active_task.done():
                         for evt in group:
                             _pr.completion_queue.put(evt)
-                        logger.error("Async delegation injection error: %s", e)
+                        continue
+                    if len(delivery_tasks) >= _MAX_ASYNC_DELEGATION_DELIVERIES:
+                        for evt in group:
+                            _pr.completion_queue.put(evt)
+                        continue
+                    task = asyncio.create_task(
+                        self._run_async_delegation_group_delivery(
+                            group,
+                            _pr.completion_queue,
+                        )
+                    )
+                    delivery_tasks[key] = task
+                    getattr(self, "_background_tasks", set()).add(task)
+                    task.add_done_callback(
+                        lambda done, route_key=key: _forget_delivery(route_key, done)
+                    )
+                    started.append(task)
+
+                if started:
+                    # Give every route group one scheduling opportunity without
+                    # waiting for a busy session's durable receipt. A tiny
+                    # bounded window also lets immediate failures restore their
+                    # events before the next queue poll.
+                    await asyncio.wait(started, timeout=0.01)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
@@ -27910,8 +28478,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            pending_event = (
+                pending_slot.get(session_key)
+                if isinstance(pending_slot, dict)
+                else None
+            )
+            if pending_event is not None and getattr(
+                pending_event, "requires_durable_acceptance", False
+            ):
+                setattr(
+                    pending_event,
+                    "_hermes_durable_acceptance_deferred",
+                    True,
+                )
+            discard_pending = getattr(adapter, "discard_pending_message", None)
+            if callable(discard_pending):
+                discard_pending(session_key)
+            elif pending_event is not None:
+                resolve_message_acceptance(pending_event, False)
         if _iac_state is not None:
+            for queued_event in list(_iac_state.conversation.queued_events):
+                if getattr(queued_event, "requires_durable_acceptance", False):
+                    setattr(
+                        queued_event,
+                        "_hermes_durable_acceptance_deferred",
+                        True,
+                    )
+                resolve_message_acceptance(queued_event, False)
+            _iac_state.conversation.queued_events.clear()
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
             self._release_running_agent_state(session_key)
@@ -28814,6 +29409,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        durable_delivery_ids: Optional[List[str]] = None,
+        resume_admitted_turn: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -28835,6 +29432,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
+                "completed": False,
+                "failed": True,
             }
 
         proxy_url = self._get_proxy_url()
@@ -28844,7 +29443,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
+                "completed": False,
+                "failed": True,
             }
+
+        from gateway.durable_delivery import (
+            DURABLE_DELIVERY_FIELD,
+            DURABLE_DELIVERY_HEADER,
+            validate_durable_delivery_ids,
+        )
+
+        durable_delivery_ids = validate_durable_delivery_ids(
+            durable_delivery_ids or []
+        )
 
         # Scope-aware read: the proxy key is a per-profile credential; under
         # multiplex honor the installed scope's verdict (Slack pattern for
@@ -28858,6 +29469,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
         except Exception:
             proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
+        if durable_delivery_ids and not proxy_key:
+            return {
+                "final_response": "⚠️ Durable proxy delivery requires GATEWAY_PROXY_KEY",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+                "completed": False,
+                "failed": True,
+            }
 
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
@@ -28886,7 +29506,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if role in {"user", "assistant"} and content:
                 api_messages.append({"role": role, "content": content})
 
-        api_messages.append({"role": "user", "content": message})
+        if not resume_admitted_turn:
+            api_messages.append({"role": "user", "content": message})
 
         # HTTP headers ---------------------------------------------------
         headers: Dict[str, str] = {"Content-Type": "application/json"}
@@ -28894,12 +29515,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+        if durable_delivery_ids:
+            headers["Idempotency-Key"] = durable_delivery_ids[0]
+            headers[DURABLE_DELIVERY_HEADER] = durable_delivery_ids[0]
 
         body = {
             "model": "hermes-agent",
             "messages": api_messages,
             "stream": True,
         }
+        if durable_delivery_ids:
+            body[DURABLE_DELIVERY_FIELD] = durable_delivery_ids
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -28960,6 +29586,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Make the HTTP request with SSE streaming -----------------------
         full_response = ""
+        terminal_proof = False
+        server_reported_complete = True
         _start = time.time()
 
         try:
@@ -28981,6 +29609,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
+                            "completed": False,
+                            "failed": True,
                         }
 
                     # Parse SSE stream
@@ -29000,6 +29630,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "history_offset": len(history),
                                 "session_id": session_id,
                                 "response_previewed": False,
+                                "completed": False,
+                                "interrupted": True,
                             }
                         text = chunk.decode("utf-8", errors="replace")
                         buffer += text
@@ -29013,11 +29645,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if line.startswith("data: "):
                                 data = line[6:]
                                 if data.strip() == "[DONE]":
+                                    terminal_proof = server_reported_complete
                                     break
                                 try:
                                     obj = json.loads(data)
+                                    hermes_status = obj.get("hermes") or {}
+                                    if hermes_status.get("completed") is False:
+                                        server_reported_complete = False
                                     choices = obj.get("choices", [])
                                     if choices:
+                                        if choices[0].get("finish_reason") == "error":
+                                            server_reported_complete = False
                                         delta = choices[0].get("delta", {})
                                         content = delta.get("content", "")
                                         if content:
@@ -29041,6 +29679,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "completed": False,
+                    "failed": True,
                 }
             # Partial response — return what we got
         finally:
@@ -29068,6 +29708,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "history_offset": len(history),
                 "session_id": session_id,
                 "response_previewed": False,
+                "completed": False,
+                "interrupted": True,
             }
         logger.info(
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
@@ -29085,6 +29727,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "completed": terminal_proof,
+            "partial": not terminal_proof,
         }
 
     # ------------------------------------------------------------------
@@ -29106,6 +29750,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        durable_delivery_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -29116,6 +29761,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        from gateway.durable_delivery import (
+            find_durable_admission,
+            validate_durable_delivery_ids,
+        )
+
+        durable_delivery_ids = validate_durable_delivery_ids(
+            durable_delivery_ids or []
+        )
+        resume_admitted_turn = False
+        if durable_delivery_ids:
+            admission_index, terminal = find_durable_admission(
+                history, durable_delivery_ids
+            )
+            if terminal is not None:
+                return {
+                    "final_response": "",
+                    "messages": history,
+                    "api_calls": 0,
+                    "completed": True,
+                    "history_offset": len(history),
+                    "session_id": session_id,
+                    "durable_delivery_replayed": True,
+                }
+            resume_admitted_turn = admission_index is not None
+            if admission_index is not None and any(
+                isinstance(item, dict) and item.get("role") == "user"
+                for item in history[admission_index + 1 :]
+            ):
+                # Appending the old assistant after a later user turn would make
+                # live memory disagree with append-only SessionDB reload order.
+                logger.error(
+                    "Refusing durable replay %s for session %s after a later "
+                    "user boundary",
+                    durable_delivery_ids,
+                    session_id,
+                )
+                return {
+                    "final_response": (
+                        "⚠️ Durable turn recovery was quarantined because newer "
+                        "transcript rows already exist. Retry after operator "
+                        "review or use /reset."
+                    ),
+                    "messages": history,
+                    "api_calls": 0,
+                    "completed": False,
+                    "failed": True,
+                    "error": "durable_turn_conflict",
+                    "retryable": True,
+                    "durable_turn_conflict": True,
+                    "history_offset": len(history),
+                    "session_id": session_id,
+                }
+
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
@@ -29126,6 +29824,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                durable_delivery_ids=durable_delivery_ids,
+                resume_admitted_turn=resume_admitted_turn,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -29139,6 +29839,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                durable_delivery_ids=durable_delivery_ids,
+                resume_admitted_turn=resume_admitted_turn,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -29282,6 +29984,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        durable_delivery_ids: Optional[List[str]] = None,
+        resume_admitted_turn: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -29306,6 +30010,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                durable_delivery_ids=durable_delivery_ids,
+                resume_admitted_turn=resume_admitted_turn,
             )
 
         from run_agent import AIAgent
@@ -29591,6 +30297,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            durable_delivery_ids=list(durable_delivery_ids or []),
+            resume_admitted_turn=resume_admitted_turn,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -30518,7 +31226,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
-            if result and adapter and session_key:
+            if (
+                durable_delivery_ids
+                and session_key
+                and _should_clear_resume_pending_after_turn(result)
+            ):
+                # Local runs drain queued follow-ups inside this method, before
+                # _handle_message_with_agent can observe the terminal result.
+                self._release_durable_fenced_events(session_key, source)
+            _pending_head = (
+                getattr(adapter, "_pending_messages", {}).get(session_key)
+                if adapter is not None and session_key
+                else None
+            )
+            if (
+                result
+                and adapter
+                and session_key
+                and not getattr(
+                    _pending_head, "_hermes_wait_for_durable_replay", False
+                )
+            ):
                 pending_event = _dequeue_pending_event(adapter, session_key)
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
@@ -30527,6 +31255,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # order, and (b) causes any mid-chain /queue to correctly
                 # route to overflow rather than jumping the queue.
                 pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                # A durable queue copy whose acceptance waiter timed out is no
+                # longer allowed to enter the conversation. Skip it (and any
+                # adjacent expired copies) so its durable row can be replayed
+                # under a fresh delivery identity instead.
+                while pending_event is not None and getattr(
+                    pending_event, "_hermes_durable_acceptance_expired", False
+                ):
+                    resolve_message_acceptance(pending_event, False)
+                    pending_event = self._promote_queued_event(
+                        session_key, adapter, None
+                    )
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
@@ -30622,7 +31361,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._requeue_recursion_cap_event(
+                            session_key, adapter, pending_event
+                        )
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
@@ -30763,6 +31504,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key=next_session_key,
                     )
                     if next_message is None:
+                        resolve_message_acceptance(pending_event, False)
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -30810,20 +31552,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                        durable_delivery_ids=(
+                            list(
+                                pending_event.metadata.get(
+                                    "hermes_completion_delivery_ids"
+                                )
+                                or []
+                            )
+                            or (
+                                [
+                                    pending_event.metadata[
+                                        "hermes_completion_delivery_id"
+                                    ]
+                                ]
+                                if pending_event is not None
+                                and pending_event.metadata.get(
+                                    "hermes_completion_delivery_id"
+                                )
+                                else []
+                            )
+                        )
+                        if pending_event is not None
+                        else [],
+                    )
+                except BaseException:
+                    resolve_message_acceptance(pending_event, False)
+                    raise
+                else:
+                    resolve_message_acceptance(
+                        pending_event, mark_message_consumed(pending_event)
+                    )
+                return _merge_queued_followup_result(
+                    result,
+                    followup_result,
+                    durable_delivery_ids,
                 )
-                return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:

@@ -111,8 +111,14 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, origin_profile):
+        posts.append(
+            {
+                "text": text,
+                "session_id": session_id,
+                "origin_profile": origin_profile,
+            }
+        )
 
     import gateway.wake as wake_mod
 
@@ -127,6 +133,7 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     )
     assert len(posts) == 1
     assert posts[0]["session_id"] == "origin-session"
+    assert posts[0]["origin_profile"] == "default"
     assert all(post["session_id"] != "worker-session" for post in posts)
     wake_text = posts[0]["text"]
     assert tid in wake_text
@@ -168,8 +175,14 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, origin_profile):
+        posts.append(
+            {
+                "text": text,
+                "session_id": session_id,
+                "origin_profile": origin_profile,
+            }
+        )
 
     import gateway.wake as wake_mod
 
@@ -178,6 +191,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert sorted(post["session_id"] for post in posts) == ["origin-a", "origin-b"]
+    assert all(post["origin_profile"] == "default" for post in posts)
     assert all(post["session_id"] != "worker-session" for post in posts)
     assert _unseen_terminal_events(tid, "api_server", "origin-a") == []
     assert _unseen_terminal_events(tid, "api_server", "origin-b") == []
@@ -192,9 +206,13 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
         "api_server", "origin-session", session_id="worker-session",
     )
     attempted_sessions = []
+    attempted_profiles = []
 
-    async def fail_once_then_succeed(adapter, *, text, session_id):
+    async def fail_once_then_succeed(
+        adapter, *, text, session_id, origin_profile
+    ):
         attempted_sessions.append(session_id)
+        attempted_profiles.append(origin_profile)
         if len(attempted_sessions) == 1:
             raise RuntimeError("simulated wake failure")
 
@@ -214,6 +232,7 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert attempted_sessions == ["origin-session", "origin-session"]
+    assert attempted_profiles == ["default", "default"]
     assert "worker-session" not in attempted_sessions
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
 

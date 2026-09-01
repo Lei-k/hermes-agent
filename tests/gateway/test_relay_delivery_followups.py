@@ -394,6 +394,7 @@ def test_durable_dispatch_persists_and_recovers_scope_id(tmp_path, monkeypatch):
         chat_type="group",
         user_id="U9",
         scope_id="G777",
+        profile="coder",
         session_key="agent:main:discord:group:C123:U9",
     )
     try:
@@ -410,6 +411,7 @@ def test_durable_dispatch_persists_and_recovers_scope_id(tmp_path, monkeypatch):
         assert record.get("scope_id") == "G777", (
             "dispatch-time capture must snapshot HERMES_SESSION_SCOPE_ID"
         )
+        assert record.get("origin_profile") == "coder"
         ad._persist_dispatch(record)
     finally:
         clear_session_vars(tokens)
@@ -432,6 +434,7 @@ def test_durable_dispatch_persists_and_recovers_scope_id(tmp_path, monkeypatch):
         "relay egress would be declined by the connector's tenant guard"
     )
     assert evt.get("user_id") == "U9"
+    assert evt.get("origin_profile") == "coder"
 
     # The gateway-side fallback reconstruction must carry it into the source.
     runner = _fallback_runner()
@@ -439,6 +442,19 @@ def test_durable_dispatch_persists_and_recovers_scope_id(tmp_path, monkeypatch):
     assert source is not None
     assert source.scope_id == "G777"
     assert source.user_id == "U9"
+    assert source.profile == "coder"
+
+
+def test_durable_dispatch_rejects_invalid_origin_profile():
+    import tools.async_delegation as ad
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(profile="../default")
+    try:
+        with pytest.raises(ValueError, match="profile"):
+            ad._capture_routing_origin()
+    finally:
+        clear_session_vars(tokens)
 
 
 def test_live_completion_event_carries_scope_id(tmp_path, monkeypatch):

@@ -65,12 +65,19 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
     auto-resume it.
     """
     assert _should_clear_resume_pending_after_turn({"final_response": "done"}) is True
-    assert _should_clear_resume_pending_after_turn({"completed": True}) is True
+    assert _should_clear_resume_pending_after_turn({"completed": True}) is False
+    assert _should_clear_resume_pending_after_turn({}) is False
+    assert _should_clear_resume_pending_after_turn({"final_response": "   "}) is False
     assert _should_clear_resume_pending_after_turn({"interrupted": True}) is False
     assert _should_clear_resume_pending_after_turn({"completed": False}) is False
     assert _should_clear_resume_pending_after_turn({"failed": True}) is False
     assert _should_clear_resume_pending_after_turn({"partial": True}) is False
     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
+    assert _should_clear_resume_pending_after_turn({
+        "completed": True,
+        "durable_delivery_replayed": True,
+        "final_response": "",
+    }) is True
 
 
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):

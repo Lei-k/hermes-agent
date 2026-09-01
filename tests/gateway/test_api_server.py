@@ -299,6 +299,51 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
     return APIServerAdapter(config)
 
 
+def test_durable_wake_route_default_stays_bare():
+    adapter = _make_adapter("listener-key-strong-enough")
+    assert adapter.resolve_durable_wake_route("default") == (
+        "/v1/chat/completions",
+        "listener-key-strong-enough",
+    )
+
+
+def test_durable_wake_route_named_uses_served_profile_auth(monkeypatch):
+    adapter = _make_adapter("listener-key-strong-enough")
+    adapter.gateway_runner = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+        )
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda **_kwargs: [("default", None), ("coder", None)],
+    )
+    monkeypatch.setattr(adapter, "_expected_api_key", lambda: "coder-key-strong-enough")
+
+    assert adapter.resolve_durable_wake_route("coder") == (
+        "/p/coder/v1/chat/completions",
+        "coder-key-strong-enough",
+    )
+
+
+def test_durable_wake_route_unserved_profile_fails_closed(monkeypatch):
+    adapter = _make_adapter("listener-key-strong-enough")
+    adapter.gateway_runner = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=[],
+        )
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda **_kwargs: [("default", None)],
+    )
+
+    with pytest.raises(ValueError, match="not served"):
+        adapter.resolve_durable_wake_route("coder")
+
+
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
@@ -1799,6 +1844,238 @@ class TestEndpointAuth:
                 json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
             )
             assert resp.status == 401
+
+
+class TestInternalDurableDelivery:
+    @pytest.mark.asyncio
+    async def test_authenticated_chat_route_passes_validated_identity(self, auth_adapter):
+        delivery_id = "async-delegation:deleg_api_route"
+        result = {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+            "completed": True,
+        }
+        app = _create_app(auth_adapter)
+        with patch.object(
+            auth_adapter,
+            "_run_agent",
+            new_callable=AsyncMock,
+            return_value=(result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+        ) as run_agent:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Id": "durable-api-session",
+                        "X-Hermes-Durable-Delivery-Id": delivery_id,
+                    },
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "completion"}],
+                        "stream": False,
+                        "hermes_durable_delivery_ids": [delivery_id],
+                    },
+                )
+
+        assert response.status == 200
+        assert run_agent.await_args.kwargs["durable_delivery_ids"] == [delivery_id]
+
+    @pytest.mark.asyncio
+    async def test_run_agent_replay_uses_transcript_not_process_cache(self, adapter):
+        delivery_id = "async-delegation:deleg_api_restart"
+        history = []
+        model_effects = 0
+
+        class Agent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+            session_id = "durable-api-session"
+
+            def run_conversation(self, user_message, conversation_history, task_id, **kwargs):
+                nonlocal model_effects
+                model_effects += 1
+                assert kwargs["durable_delivery_ids"] == [delivery_id]
+                assert kwargs["resume_admitted_turn"] is False
+                conversation_history.extend([
+                    {
+                        "role": "user",
+                        "content": user_message,
+                        "message_id": delivery_id,
+                        "display_metadata": {
+                            "hermes_completion_delivery_ids": [delivery_id]
+                        },
+                    },
+                    {"role": "assistant", "content": "incorporated"},
+                ])
+                return {
+                    "final_response": "incorporated",
+                    "messages": conversation_history,
+                    "api_calls": 1,
+                    "completed": True,
+                }
+
+        with patch.object(adapter, "_create_agent", return_value=Agent()) as create_agent:
+            first, _usage = await adapter._run_agent(
+                user_message="completion",
+                conversation_history=history,
+                session_id="durable-api-session",
+                durable_delivery_ids=[delivery_id],
+            )
+            second, _usage = await adapter._run_agent(
+                user_message="completion",
+                conversation_history=history,
+                session_id="durable-api-session",
+                durable_delivery_ids=[delivery_id],
+            )
+
+        assert first["completed"] is True
+        assert second["durable_delivery_replayed"] is True
+        assert second["final_response"] == "incorporated"
+        assert create_agent.call_count == 1
+        assert model_effects == 1
+        assert sum(item.get("message_id") == delivery_id for item in history) == 1
+
+    @pytest.mark.asyncio
+    async def test_run_agent_does_not_ack_or_merge_a_later_user_turn(self, adapter):
+        delivery_id = "async-delegation:deleg_api_turn_boundary"
+        durable_user = {
+            "role": "user",
+            "content": "durable completion",
+            "message_id": delivery_id,
+            "display_metadata": {
+                "hermes_completion_delivery_ids": [delivery_id]
+            },
+        }
+        later_turn = [
+            {"role": "user", "content": "unrelated request"},
+            {"role": "assistant", "content": "unrelated response"},
+        ]
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            result, usage = await adapter._run_agent(
+                user_message="durable completion",
+                conversation_history=[durable_user, *later_turn],
+                session_id="durable-api-session",
+                durable_delivery_ids=[delivery_id],
+            )
+
+        assert result.get("durable_delivery_replayed") is not True
+        assert result["durable_turn_conflict"] is True
+        assert result["completed"] is False
+        assert result["error"] == "durable_turn_conflict"
+        assert result["retryable"] is True
+        assert result["messages"] == [durable_user, *later_turn]
+        assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_late_linked_terminal_after_user_boundary_is_api_conflict(self, adapter):
+        delivery_id = "async-delegation:deleg_api_late_terminal"
+        history = [
+            {
+                "role": "user",
+                "content": "durable completion",
+                "message_id": delivery_id,
+                "display_metadata": {
+                    "hermes_completion_delivery_ids": [delivery_id]
+                },
+            },
+            {"role": "user", "content": "unrelated request"},
+            {"role": "assistant", "content": "unrelated response"},
+            {
+                "role": "assistant",
+                "content": "late durable terminal",
+                "display_metadata": {
+                    "hermes_completion_delivery_ids": [delivery_id]
+                },
+            },
+        ]
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            result, _usage = await adapter._run_agent(
+                user_message="durable completion",
+                conversation_history=history,
+                session_id="durable-api-session",
+                durable_delivery_ids=[delivery_id],
+            )
+
+        assert result.get("durable_delivery_replayed") is not True
+        assert result["durable_turn_conflict"] is True
+        assert result["completed"] is False
+        assert result["error"] == "durable_turn_conflict"
+        assert result["messages"] == history
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_self_post_boundary_conflict_fails_without_ack(self, monkeypatch):
+        """The real wake HTTP seam rejects a quarantined durable transcript."""
+        from aiohttp.test_utils import TestServer
+
+        import gateway.wake as wake_mod
+
+        delivery_id = "async-delegation:deleg_api_self_post_conflict"
+        history = [
+            {
+                "role": "user",
+                "content": "durable completion",
+                "message_id": delivery_id,
+                "display_metadata": {
+                    "hermes_completion_delivery_ids": [delivery_id]
+                },
+            },
+            {"role": "user", "content": "unrelated request"},
+            {"role": "assistant", "content": "unrelated response"},
+        ]
+
+        class TranscriptDB:
+            def get_messages_as_conversation(self, session_id):
+                assert session_id == "durable-api-session"
+                return history
+
+        adapter = _make_adapter(api_key="sk-secret")
+
+        async def _db():
+            return TranscriptDB()
+
+        monkeypatch.setattr(adapter, "_ensure_session_db_async", _db)
+        monkeypatch.setattr(wake_mod, "_RETRY_DELAYS_SECONDS", ())
+        server = TestServer(_create_app(adapter))
+        await server.start_server()
+        adapter._host = "127.0.0.1"
+        adapter._port = server.port
+        try:
+            with patch.object(adapter, "_create_agent") as create_agent:
+                with pytest.raises(RuntimeError, match="incomplete turn"):
+                    await wake_mod.deliver_wake(
+                        adapter,
+                        text="durable completion",
+                        session_id="durable-api-session",
+                        durable_delivery_ids=[delivery_id],
+                    )
+        finally:
+            await server.close()
+
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_durable_identity_rejects_unauthenticated_or_mismatched_input(self):
+        delivery_id = "async-delegation:deleg_invalid_auth"
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Durable-Delivery-Id": delivery_id},
+                json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "completion"}],
+                    "hermes_durable_delivery_ids": [delivery_id + "-other"],
+                },
+            )
+        assert response.status in {400, 403}
 
 
 # ---------------------------------------------------------------------------

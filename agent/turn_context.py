@@ -514,6 +514,8 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
+    durable_delivery_ids: Optional[List[str]] = None,
+    resume_admitted_turn: bool = False,
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
@@ -714,7 +716,23 @@ def build_turn_context(
     expected_persist_content = (
         persist_user_message if persist_user_message is not None else user_message
     )
-    if (
+    if resume_admitted_turn and durable_delivery_ids:
+        wanted = set(durable_delivery_ids)
+        user_msg = None
+        for candidate in reversed(messages):
+            if not isinstance(candidate, dict) or candidate.get("role") != "user":
+                continue
+            metadata = candidate.get("display_metadata") or {}
+            carried = set(metadata.get("hermes_completion_delivery_ids") or [])
+            message_id = candidate.get("message_id")
+            if message_id:
+                carried.add(str(message_id))
+            if wanted & carried:
+                user_msg = candidate
+                break
+        if user_msg is None:
+            raise RuntimeError("durable completion admission row disappeared")
+    elif (
         isinstance(pending_cli_message, dict)
         and pending_cli_message.get("content") == expected_persist_content
     ):
@@ -764,12 +782,24 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
-    append_message(messages, user_msg)
-    current_turn_user_idx = len(messages) - 1
+    if durable_delivery_ids:
+        delivery_metadata = dict(user_msg.get("display_metadata") or {})
+        delivery_metadata["hermes_completion_delivery_ids"] = list(
+            durable_delivery_ids
+        )
+        user_msg["display_metadata"] = delivery_metadata
+        user_msg["message_id"] = durable_delivery_ids[0]
+
+    if resume_admitted_turn:
+        current_turn_user_idx = messages.index(user_msg)
+    else:
+        append_message(messages, user_msg)
+        current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
     # Track user turns for memory flush and periodic nudge logic.
-    agent._user_turn_count += 1
+    if not resume_admitted_turn:
+        agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is
     # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
     agent._is_user_initiated_turn = True

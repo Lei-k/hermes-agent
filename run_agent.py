@@ -2396,6 +2396,7 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
+                    "message_id": msg.get("message_id"),
                 }
                 if isinstance(msg.get("_row_id"), int):
                     _row["_row_id"] = msg["_row_id"]
@@ -8624,6 +8625,8 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        durable_delivery_ids: Optional[List[str]] = None,
+        resume_admitted_turn: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8998,6 +9001,8 @@ class AIAgent:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
+                        durable_delivery_ids=durable_delivery_ids,
+                        resume_admitted_turn=resume_admitted_turn,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but

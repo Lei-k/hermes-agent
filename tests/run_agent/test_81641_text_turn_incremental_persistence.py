@@ -59,7 +59,15 @@ def loop_agent():
         return agent
 
 
-def _run_text_turn(agent, answer: str, *, flush_side_effect=None):
+def _run_text_turn(
+    agent,
+    answer: str,
+    *,
+    flush_side_effect=None,
+    durable_delivery_ids=None,
+    conversation_history=None,
+    user_message="what is 2 + 2?",
+):
     """Drive one clean finish_reason=stop turn, recording persistence calls.
 
     Returns ``(result, events)`` where ``events`` is the ordered log of
@@ -84,6 +92,16 @@ def _run_text_turn(agent, answer: str, *, flush_side_effect=None):
                 if isinstance(m, dict)
             ],
         ))
+        events.append((
+            "flush_delivery_ids",
+            [
+                (m.get("display_metadata") or {}).get(
+                    "hermes_completion_delivery_ids"
+                )
+                for m in messages
+                if isinstance(m, dict) and m.get("role") == "assistant"
+            ],
+        ))
         if flush_side_effect is not None:
             raise flush_side_effect
         return True
@@ -99,12 +117,66 @@ def _run_text_turn(agent, answer: str, *, flush_side_effect=None):
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("what is 2 + 2?")
+        result = agent.run_conversation(
+            user_message,
+            conversation_history=conversation_history,
+            durable_delivery_ids=durable_delivery_ids,
+        )
 
     return result, events
 
 
 class TestCompletedTextTurnIncrementalPersistence:
+    def test_durable_turn_flushes_identity_on_terminal_assistant(self, loop_agent):
+        from gateway.durable_delivery import find_durable_admission
+
+        delivery_ids = [
+            "async-delegation:deleg-terminal-primary",
+            "async-delegation:deleg-terminal-sibling",
+        ]
+
+        result, events = _run_text_turn(
+            loop_agent,
+            "Durable answer.",
+            durable_delivery_ids=delivery_ids,
+        )
+
+        assert result["final_response"] == "Durable answer."
+        assert any(
+            kind == "flush_delivery_ids"
+            and snapshot
+            and snapshot[-1] == delivery_ids
+            for kind, snapshot in events
+        )
+
+        terminal = result["messages"][-1]
+        assert terminal["role"] == "assistant"
+        assert terminal["content"] == "Durable answer."
+        assert terminal["display_metadata"][
+            "hermes_completion_delivery_ids"
+        ] == delivery_ids
+
+        later, _ = _run_text_turn(
+            loop_agent,
+            "Later answer.",
+            conversation_history=result["messages"],
+            user_message="unrelated later request",
+        )
+        admission_index, found = find_durable_admission(
+            later["messages"], delivery_ids
+        )
+        assert admission_index is not None
+        assert found is terminal
+
+        provider_messages = (
+            loop_agent.client.chat.completions.create.call_args.kwargs["messages"]
+        )
+        assert all("display_metadata" not in message for message in provider_messages)
+        assert all(
+            "hermes_completion_delivery_ids" not in message
+            for message in provider_messages
+        )
+
     def test_completed_text_turn_is_flushed_before_finalization(self, loop_agent):
         """The assistant row must reach the session DB before the loop exits.
 

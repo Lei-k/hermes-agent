@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import MessageDispatchStatus, resolve_message_acceptance
 from gateway.run import GatewayRunner
 
 
@@ -32,7 +33,13 @@ class _RelayAdapter:
 
     def __init__(self):
         self.handled = []
-        self.handle_message = AsyncMock(side_effect=self.handled.append)
+
+        async def _handle(event):
+            self.handled.append(event)
+            resolve_message_acceptance(event, True)
+            return MessageDispatchStatus.ACCEPTED
+
+        self.handle_message = AsyncMock(side_effect=_handle)
 
     def fronts_platform(self, platform):
         return platform == Platform.SLACK
@@ -57,6 +64,7 @@ def _slack_async_event():
         "status": "completed",
         "is_batch": True,
         "results": [{"goal": "g1", "status": "completed", "summary": "done"}],
+        "origin_profile": "default",
     }
 
 
