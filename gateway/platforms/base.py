@@ -2421,6 +2421,14 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+class MessageDispatchStatus(Enum):
+    """Immediate adapter disposition for durable producers awaiting acceptance."""
+
+    ACCEPTED = "accepted"
+    DEFERRED = "deferred"
+    REJECTED = "rejected"
+
+
 @dataclass
 class MessageEvent:
     """
@@ -2508,10 +2516,14 @@ class MessageEvent:
     timestamp: datetime = field(default_factory=datetime.now)
 
     # Whether this event may resolve gateway commands or pending control
-    # prompts. Kept last to preserve positional construction compatibility.
+    # prompts. Kept near the tail to preserve positional construction compatibility.
     # Proactive plugin events set this to False so untrusted payload text
     # remains conversational input.
     allow_gateway_control: bool = True
+
+    # Durable internal producers set this when a volatile busy-session queue is
+    # not an acceptable handoff. Kept last for positional-construction safety.
+    requires_durable_acceptance: bool = False
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -2542,6 +2554,33 @@ class MessageEvent:
         # iOS auto-corrects -- to — (em dash) and - to – (en dash)
         args = args.replace("\u2014\u2014", "--").replace("\u2014", "--").replace("\u2013", "-")
         return args
+
+
+def resolve_message_acceptance(event: MessageEvent, accepted: bool) -> None:
+    """Resolve a durable internal event's process-local receipt exactly once.
+
+    GatewayRunner may consume an adapter-queued event inside its own FIFO
+    recursion, bypassing ``_process_message_background`` for that exact event.
+    Sharing this resolver keeps acknowledgement tied to the completion event's
+    identity rather than to whichever user/internal event owns the outer turn.
+    """
+    receipt = getattr(event, "_hermes_durable_acceptance_receipt", None)
+    if isinstance(receipt, asyncio.Future) and not receipt.done():
+        receipt.set_result(bool(accepted))
+
+
+def mark_message_consumed(event: MessageEvent) -> bool:
+    """Run a durable producer's idempotent consumption hook, if present."""
+    if getattr(event, "_hermes_durable_acceptance_deferred", False):
+        return False
+    callback = getattr(event, "_hermes_mark_durable_consumed", None)
+    if not callable(callback):
+        return True
+    try:
+        return callback() is not False
+    except Exception:
+        logger.exception("Could not persist durable message consumption")
+        return False
 
 
 @dataclass
@@ -5834,6 +5873,17 @@ class BasePlatformAdapter(ABC):
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender."""
 
+        # Internal inbox events and ordinary user messages may share the same
+        # platform sender identity, but they must never be text-merged: doing
+        # so erases the completion's durable receipt and changes arrival order.
+        if (
+            existing.internal != event.internal
+            or existing.allow_gateway_control != event.allow_gateway_control
+            or existing.requires_durable_acceptance
+            != event.requires_durable_acceptance
+        ):
+            return False
+
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
             if source is None:
@@ -6028,7 +6078,7 @@ class BasePlatformAdapter(ABC):
             session_key,
         )
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        self.discard_pending_message(session_key)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -6051,6 +6101,8 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = guard
 
         task = asyncio.create_task(self._process_message_background(event, session_key))
+        if event.requires_durable_acceptance:
+            setattr(event, "_hermes_durable_owner_task", task)
         self._session_tasks[session_key] = task
         try:
             self._background_tasks.add(task)
@@ -6111,7 +6163,7 @@ class BasePlatformAdapter(ABC):
                     exc_info=True,
                 )
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            self.discard_pending_message(session_key)
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -6211,16 +6263,54 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def dispatch_durable_message(
+        self, event: MessageEvent,
+    ) -> MessageDispatchStatus:
+        """Dispatch one durable internal event through base-owned admission.
+
+        ``handle_message`` predates durable receipts and third-party adapters
+        commonly override it with the historical ``None`` return contract.
+        Durable producers call this additive seam instead: invoking the base
+        implementation directly prevents an old override from swallowing the
+        event while preserving that override for ordinary platform ingress.
+        """
+        if not event.requires_durable_acceptance:
+            raise ValueError("dispatch_durable_message requires a durable event")
+        status = await BasePlatformAdapter.handle_message(self, event)
+        return status or MessageDispatchStatus.REJECTED
+
+    async def cancel_durable_message(self, event: MessageEvent) -> None:
+        """Cancel and fully unwind this event's base-owned durable dispatch."""
+        task = getattr(event, "_hermes_durable_owner_task", None)
+        if isinstance(task, asyncio.Task) and not task.done():
+            self._expected_cancelled_tasks.add(task)
+            task.cancel()
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(
+                    "[%s] Durable dispatch cancellation raised", self.name,
+                    exc_info=True,
+                )
+        resolve_message_acceptance(event, False)
+
+    async def handle_message(self, event: MessageEvent) -> Optional[MessageDispatchStatus]:
         """
         Process an incoming message.
-        
+
         This method returns quickly by spawning background tasks.
         This allows new messages to be processed even while an agent is running,
-        enabling interruption support.
+        enabling interruption support. Durable producers can distinguish a
+        started task from a busy-session deferral via the return status.
         """
         if not self._message_handler:
-            return
+            return (
+                MessageDispatchStatus.REJECTED
+                if event.requires_durable_acceptance
+                else None
+            )
 
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
@@ -6251,7 +6341,11 @@ class BasePlatformAdapter(ABC):
                 expected_session_key,
                 session_key,
             )
-            return
+            return (
+                MessageDispatchStatus.REJECTED
+                if event.requires_durable_acceptance
+                else None
+            )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -6263,6 +6357,24 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            # Durable internal completions are inbox events, never commands or
+            # clarify replies. Admit them before every gateway-control
+            # intercept so completion text cannot answer a blocked prompt or
+            # run a slash-command path accidentally.
+            if event.requires_durable_acceptance:
+                if self._busy_session_handler is not None:
+                    try:
+                        if await self._busy_session_handler(event, session_key):
+                            return MessageDispatchStatus.ACCEPTED
+                    except Exception as e:
+                        logger.error(
+                            "[%s] Durable busy-session admission failed: %s",
+                            self.name,
+                            e,
+                            exc_info=True,
+                        )
+                return MessageDispatchStatus.DEFERRED
+
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:
@@ -6383,7 +6495,7 @@ class BasePlatformAdapter(ABC):
             if self._busy_session_handler is not None:
                 try:
                     if await self._busy_session_handler(event, session_key):
-                        return
+                        return None
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
 
@@ -6393,7 +6505,7 @@ class BasePlatformAdapter(ABC):
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
                 merge_pending_message_event(self._pending_messages, session_key, event)
-                return  # Don't interrupt now - will run after current task completes
+                return
 
             if self._is_queue_text_debounce_candidate(event):
                 logger.debug(
@@ -6417,8 +6529,8 @@ class BasePlatformAdapter(ABC):
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
                 )
-            return  # Don't process now - will be handled after current task finishes
-        
+            return
+
         # Mark session as active BEFORE spawning background task to close
         # the race window where a second message arriving before the task
         # starts would also pass the _active_sessions check and spawn a
@@ -6426,7 +6538,17 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
+        if self._start_session_processing(event, session_key):
+            return (
+                MessageDispatchStatus.ACCEPTED
+                if event.requires_durable_acceptance
+                else None
+            )
+        return (
+            MessageDispatchStatus.REJECTED
+            if event.requires_durable_acceptance
+            else None
+        )
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -6457,6 +6579,9 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        def _resolve_durable_acceptance(accepted: bool) -> None:
+            resolve_message_acceptance(event, accepted)
+
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -6506,8 +6631,14 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
 
-            # Call the handler (this can take a while with tool calls)
-            response = await self._message_handler(event)
+            # Call the handler (this can take a while with tool calls). The
+            # durable producer is acknowledged only after the gateway turn has
+            # returned, never merely because the adapter queued or spawned it.
+            handler = self._message_handler
+            if handler is None:
+                raise RuntimeError("message handler disappeared before dispatch")
+            response = await handler(event)
+            _resolve_durable_acceptance(mark_message_consumed(event))
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -7027,8 +7158,14 @@ class BasePlatformAdapter(ABC):
             # this task hand off the follow-up.
             await self._flush_text_debounce_now(session_key)
 
-            # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
+            # Check if there's a pending message that was queued during our processing.
+            # A durable-turn fence deliberately leaves its head parked until the
+            # matching replay has terminal proof; draining it here would let a
+            # generic/user turn overtake that replay.
+            _pending_head = self._pending_messages.get(session_key)
+            if _pending_head is not None and not getattr(
+                _pending_head, "_hermes_wait_for_durable_replay", False
+            ):
                 pending_event = self._pending_messages.pop(session_key)
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 # Keep the _active_sessions entry live across the turn chain
@@ -7067,6 +7204,7 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            _resolve_durable_acceptance(False)
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -7074,6 +7212,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except BaseException as e:
+            _resolve_durable_acceptance(False)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
@@ -7104,6 +7243,8 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            # Defensive fallback for failures before the handler await begins.
+            _resolve_durable_acceptance(False)
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.
@@ -7160,7 +7301,12 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            _late_head = self._pending_messages.get(session_key)
+            late_pending = None
+            if not getattr(
+                _late_head, "_hermes_wait_for_durable_replay", False
+            ):
+                late_pending = self._pending_messages.pop(session_key, None)
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
@@ -7289,7 +7435,21 @@ class BasePlatformAdapter(ABC):
         self._background_tasks.clear()
         self._expected_cancelled_tasks.clear()
         self._session_tasks.clear()
-        # Flush pending messages to disk before clearing (#72680).
+        # Durable completion payloads remain authoritative in their SQLite
+        # ledger. Never spool them into the user-message shutdown file: reject
+        # their process-local receipts so the claims become replayable, and
+        # flush only ordinary user follow-ups.
+        for session_key, pending_event in list(self._pending_messages.items()):
+            if pending_event.requires_durable_acceptance:
+                self._pending_messages.pop(session_key, None)
+                setattr(
+                    pending_event,
+                    "_hermes_durable_acceptance_deferred",
+                    True,
+                )
+                resolve_message_acceptance(pending_event, False)
+
+        # Flush ordinary pending messages to disk before clearing (#72680).
         try:
             from gateway.shutdown_flush import flush_pending_to_file
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
@@ -7309,6 +7469,13 @@ class BasePlatformAdapter(ABC):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
+
+    def discard_pending_message(self, session_key: str) -> Optional[MessageEvent]:
+        """Discard one pending event and reject its durable receipt, if any."""
+        event = self._pending_messages.pop(session_key, None)
+        if event is not None:
+            resolve_message_acceptance(event, False)
+        return event
     
     def build_source(
         self,

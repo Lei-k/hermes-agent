@@ -218,6 +218,46 @@ def test_user_message_preserves_platform_event_timestamp():
     assert ctx.messages[-1]["timestamp"] == 123.5
 
 
+def test_durable_delivery_identity_is_on_the_crash_resilient_user_row():
+    agent = _FakeAgent()
+    delivery_ids = ["async-delegation:d1", "async-delegation:d2"]
+
+    ctx = _build(agent, durable_delivery_ids=delivery_ids)
+
+    user = ctx.messages[-1]
+    assert user["message_id"] == delivery_ids[0]
+    assert user["display_metadata"]["hermes_completion_delivery_ids"] == delivery_ids
+    assert agent._persist_calls == 1
+
+
+def test_resume_admitted_turn_reuses_identity_row_without_appending_user():
+    agent = _FakeAgent()
+    delivery_id = "async-delegation:d-resume"
+    history = [
+        {
+            "role": "user",
+            "content": "completion",
+            "message_id": delivery_id,
+            "display_metadata": {
+                "hermes_completion_delivery_ids": [delivery_id]
+            },
+        },
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "tc"}]},
+        {"role": "tool", "content": "persisted effect"},
+    ]
+
+    ctx = _build(
+        agent,
+        user_message="completion",
+        conversation_history=history,
+        durable_delivery_ids=[delivery_id],
+        resume_admitted_turn=True,
+    )
+
+    assert ctx.messages == history
+    assert sum(item.get("message_id") == delivery_id for item in ctx.messages) == 1
+
+
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
 #
 # The prologue is the ONLY place the per-turn synchronous

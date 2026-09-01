@@ -1843,6 +1843,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    durable_delivery_ids: Optional[List[str]] = None,
+    resume_admitted_turn: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1917,6 +1919,8 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        durable_delivery_ids=durable_delivery_ids,
+        resume_admitted_turn=resume_admitted_turn,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
@@ -8466,6 +8470,12 @@ def run_conversation(
                     final_response = None
                     continue
 
+                if durable_delivery_ids:
+                    terminal_metadata = dict(final_msg.get("display_metadata") or {})
+                    terminal_metadata["hermes_completion_delivery_ids"] = list(
+                        durable_delivery_ids
+                    )
+                    final_msg["display_metadata"] = terminal_metadata
                 append_message(messages, final_msg)
                 # Make the completed answer durable before leaving the loop —
                 # a session torn down before finalize_turn's _persist_session

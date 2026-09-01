@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import MessageDispatchStatus, resolve_message_acceptance
 from gateway.relay.adapter import RelayAdapter
 from gateway.session import SessionSource
 
@@ -86,6 +87,8 @@ async def test_injection_path_primes_before_handle_message():
 
         async def handle_message(self, event):
             calls.append(("handle", getattr(event.source, "chat_id", None)))
+            resolve_message_acceptance(event, True)
+            return MessageDispatchStatus.ACCEPTED
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
@@ -101,6 +104,7 @@ async def test_injection_path_primes_before_handle_message():
         "chat_type": "dm",
         "chat_id": "D0BJTDCSR7C",
         "status": "completed",
+        "origin_profile": "default",
     }
     result = await runner._inject_watch_notification("[done]", evt)
     assert result is True

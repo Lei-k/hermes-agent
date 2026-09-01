@@ -91,6 +91,8 @@ class TurnContext:
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
+    durable_delivery_ids: List[str] = field(default_factory=list)
+    resume_admitted_turn: bool = False
     # display_kind stamped on the persisted user row at turn start when this
     # turn was self-injected (MessageEvent.internal), e.g.
     # "internal_notification" for async-delegation/background notifications

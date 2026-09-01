@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -171,6 +172,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
+            delivery_claim_pid INTEGER,
+            delivery_claim_started_at INTEGER,
+            consumed_at REAL,
             origin_session_id TEXT NOT NULL DEFAULT ''
         )"""
     )
@@ -181,6 +185,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("task_json", "TEXT"),
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
+        ("delivery_claim_pid", "INTEGER"),
+        ("delivery_claim_started_at", "INTEGER"),
+        ("consumed_at", "REAL"),
         # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
         # request — the wake self-post target. Without persisting it,
         # completions recovered after a process restart are unroutable on
@@ -238,6 +245,16 @@ def _capture_routing_origin() -> Dict[str, Any]:
                 origin[evt_key] = value
     except Exception:  # noqa: BLE001 - routing origin is additive, never fatal
         pass
+
+    from gateway.durable_delivery import validate_origin_profile
+    from gateway.session_context import get_session_env
+
+    profile = get_session_env("HERMES_SESSION_PROFILE", "")
+    if not profile:
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile = get_active_profile_name() or "default"
+    origin["origin_profile"] = validate_origin_profile(profile)
     return origin
 
 
@@ -252,10 +269,10 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
-            # Routing origin (scope_id/user_id/user_name): persisted so a
+            # Routing origin (scope_id/user_id/user_name/profile): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
-            "scope_id", "user_id", "user_name",
+            "scope_id", "user_id", "user_name", "origin_profile",
         )
         if key in record
     }
@@ -383,7 +400,7 @@ def recover_abandoned_delegations() -> int:
             # Routing origin persisted at dispatch (see _capture_routing_origin):
             # restores scope_id/user_id for the reconstructed SessionSource so
             # relay egress priming works after a restart.
-            for _k in ("scope_id", "user_id", "user_name"):
+            for _k in ("scope_id", "user_id", "user_name", "origin_profile"):
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
@@ -395,6 +412,47 @@ def recover_abandoned_delegations() -> int:
             )
             recovered += 1
     return recovered
+
+
+def _release_orphaned_delivery_claims(conn: sqlite3.Connection, now: float) -> int:
+    """Release claims whose owner died, plus stale pre-owner-schema claims."""
+    try:
+        from gateway.status import _pid_exists, get_process_start_time
+    except Exception:
+        return 0
+
+    released = 0
+    rows = conn.execute(
+        """SELECT delegation_id, delivery_claim_pid,
+                  delivery_claim_started_at, delivery_claimed_at
+           FROM async_delegations
+           WHERE delivery_state='pending' AND delivery_claim IS NOT NULL
+        """
+    ).fetchall()
+    for delegation_id, pid, started_at, claimed_at in rows:
+        if pid is None:
+            # Compatibility for claims written before owner PID metadata was
+            # added. New claims never use this timestamp-only lease path.
+            live = claimed_at is not None and claimed_at >= now - 300
+        else:
+            live = _pid_exists(int(pid))
+            if live and started_at is not None:
+                current_started_at = get_process_start_time(int(pid))
+                if current_started_at is not None:
+                    live = int(current_started_at) == int(started_at)
+        if live:
+            continue
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_claim=NULL,
+                      delivery_claimed_at=NULL, delivery_claim_pid=NULL,
+                      delivery_claim_started_at=NULL,
+                      delivery_attempts=MAX(delivery_attempts - 1, 0),
+                      updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'""",
+            (now, delegation_id),
+        )
+        released += cur.rowcount
+    return released
 
 
 def restore_undelivered_completions(target_queue) -> int:
@@ -420,6 +478,7 @@ def restore_undelivered_completions(target_queue) -> int:
     now = time.time()
     restored = 0
     with _DB_LOCK, _transaction() as conn:
+        _release_orphaned_delivery_claims(conn, now)
         rows = conn.execute(
             """SELECT delegation_id, event_json, completed_at, dispatched_at
                FROM async_delegations
@@ -432,7 +491,8 @@ def restore_undelivered_completions(target_queue) -> int:
                 conn.execute(
                     """UPDATE async_delegations SET delivery_state='dropped',
                               delivery_claim=NULL, delivery_claimed_at=NULL,
-                              updated_at=?
+                              delivery_claim_pid=NULL,
+                              delivery_claim_started_at=NULL, updated_at=?
                        WHERE delegation_id=? AND delivery_state='pending'""",
                     (now, delegation_id),
                 )
@@ -467,6 +527,13 @@ def mark_completion_delivered(delegation_id: str) -> bool:
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
+    owner_pid = os.getpid()
+    try:
+        from gateway.status import get_process_start_time
+
+        owner_started_at = get_process_start_time(owner_pid)
+    except Exception:
+        owner_started_at = None
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
@@ -476,10 +543,18 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             return True  # legacy event created before durable dispatch
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
+                      delivery_claim_pid=?, delivery_claim_started_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
-                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+                 AND delivery_claim IS NULL""",
+            (
+                claim_id,
+                now,
+                owner_pid,
+                owner_started_at,
+                now,
+                delegation_id,
+            ),
         )
         return cur.rowcount == 1
 
@@ -509,7 +584,9 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     with _DB_LOCK, _transaction() as conn:
         capped = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
-                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                      delivery_claim=NULL, delivery_claimed_at=NULL,
+                      delivery_claim_pid=NULL,
+                      delivery_claim_started_at=NULL, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=? AND delivery_attempts>=?""",
             (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
@@ -523,12 +600,59 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             return True
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=NULL,
-                      delivery_claimed_at=NULL, updated_at=?
+                      delivery_claimed_at=NULL, delivery_claim_pid=NULL,
+                      delivery_claim_started_at=NULL, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=?""",
             (now, delegation_id, claim_id),
         )
         return cur.rowcount == 1
+
+
+def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Return an admission-blocked claim without consuming retry budget.
+
+    A busy originating session is backpressure, not a failed delivery attempt.
+    The completion stays authoritative in SQLite and can be reclaimed once the
+    foreground turn (or its /stop command) releases the session.
+    """
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_claim=NULL,
+                      delivery_claimed_at=NULL, delivery_claim_pid=NULL,
+                      delivery_claim_started_at=NULL,
+                      delivery_attempts=MAX(delivery_attempts - 1, 0),
+                      updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
+def defer_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+    if claim_id and evt.get("type") == "async_delegation":
+        defer_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+
+
+def mark_completion_delivery_consumed(delegation_id: str) -> bool:
+    """Persist successful turn consumption before the producer ACK boundary."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations
+               SET consumed_at=COALESCE(consumed_at, ?), updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'""",
+            (now, now, delegation_id),
+        )
+        if cur.rowcount == 1:
+            return True
+        row = conn.execute(
+            "SELECT consumed_at FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        return row is not None and row[0] is not None
 
 
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -545,7 +669,8 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
                       updated_at=?, delivery_claim=NULL,
-                      delivery_claimed_at=NULL
+                      delivery_claimed_at=NULL, delivery_claim_pid=NULL,
+                      delivery_claim_started_at=NULL
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=?""",
             (now, delegation_id, claim_id),
@@ -554,23 +679,37 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Acknowledge acceptance for the consumer holding this claim."""
+    """Idempotently acknowledge acceptance for a durable delivery identity."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
-                      delivery_claimed_at=NULL
+                      delivery_claimed_at=NULL, delivery_claim_pid=NULL,
+                      delivery_claim_started_at=NULL
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),
         )
-        return cur.rowcount == 1
+        if cur.rowcount == 1:
+            return True
+        # The acknowledgement may have committed even if its caller lost the
+        # response. Once this delivery identity is terminally delivered, a
+        # repeated ACK is success rather than a false rejection that could
+        # trigger duplicate replay. Other states still fail closed.
+        row = conn.execute(
+            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        return row is not None and row[0] == "delivered"
 
 
-def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
-        complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
+    if not claim_id or evt.get("type") != "async_delegation":
+        return True
+    return complete_completion_delivery(
+        str(evt.get("delegation_id") or ""), claim_id
+    )
 
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
@@ -583,7 +722,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, consumed_at
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -594,6 +733,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "consumed_at": row[8],
     }
 
 
@@ -996,7 +1136,7 @@ def _push_completion_event(
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in ("scope_id", "user_id", "user_name", "origin_profile"):
         if record.get(_k):
             evt[_k] = record[_k]
     # Structured stall metadata (#51690) — additive, present only on
@@ -1210,7 +1350,7 @@ def _push_batch_completion_event(
         "completed_at": completed_at,
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in ("scope_id", "user_id", "user_name"):
+    for _k in ("scope_id", "user_id", "user_name", "origin_profile"):
         if event_record.get(_k):
             evt[_k] = event_record[_k]
     # Structured stall metadata (#51690) — additive, present only on

@@ -159,11 +159,15 @@ class TestRunAgentProxyDispatch:
             session_id="test-session-123",
             session_key="test-key",
             run_generation=7,
+            durable_delivery_ids=["async-delegation:deleg_proxy_dispatch"],
         )
 
         assert result["final_response"] == "Hello from remote!"
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
+        assert runner._run_agent_via_proxy.call_args.kwargs[
+            "durable_delivery_ids"
+        ] == ["async-delegation:deleg_proxy_dispatch"]
 
 
 class TestRunAgentViaProxy:
@@ -198,6 +202,7 @@ class TestRunAgentViaProxy:
                         ],
                         source=source,
                         session_id="session-abc",
+                        durable_delivery_ids=["async-delegation:deleg_proxy_wire"],
                     )
 
         # Verify request URL
@@ -208,6 +213,15 @@ class TestRunAgentViaProxy:
 
         # Verify session ID header
         assert session.captured_headers["X-Hermes-Session-Id"] == "session-abc"
+        assert session.captured_headers["Idempotency-Key"] == (
+            "async-delegation:deleg_proxy_wire"
+        )
+        assert session.captured_headers["X-Hermes-Durable-Delivery-Id"] == (
+            "async-delegation:deleg_proxy_wire"
+        )
+        assert session.captured_json["hermes_durable_delivery_ids"] == [
+            "async-delegation:deleg_proxy_wire"
+        ]
 
         # Verify messages include system, history, and current message
         messages = session.captured_json["messages"]
@@ -221,6 +235,7 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+        assert result["completed"] is True
 
 
     @pytest.mark.asyncio
@@ -252,6 +267,138 @@ class TestRunAgentViaProxy:
                     )
 
         assert "Proxy connection error" in result["final_response"]
+        assert result["completed"] is False
+
+    @pytest.mark.asyncio
+    async def test_lost_response_retry_has_one_remote_effect_and_terminal_proof(
+        self, monkeypatch
+    ):
+        """Retry reuses remote admission identity; only [DONE] is terminal proof."""
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+        runner = _make_runner()
+        source = _make_source()
+        delivery_id = "async-delegation:deleg_proxy_loss"
+        admitted = set()
+        model_effects = 0
+        requests = []
+
+        class LostResponse(_FakeSSEResponse):
+            async def iter_any(self):
+                yield b'data: {"choices":[{"delta":{"content":"incorporated"}}]}\n\n'
+                raise ConnectionError("response lost after remote commit")
+
+        responses = [
+            LostResponse(status=200),
+            _FakeSSEResponse(
+                status=200,
+                sse_chunks=[
+                    b'data: {"choices":[{"delta":{"content":"incorporated"}}]}\n\n',
+                    b"data: [DONE]\n\n",
+                ],
+            ),
+        ]
+
+        class RetrySession:
+            def post(self, _url, json=None, headers=None, **_kwargs):
+                nonlocal model_effects
+                requests.append((json, headers))
+                identity = tuple(json["hermes_durable_delivery_ids"])
+                if identity not in admitted:
+                    admitted.add(identity)
+                    model_effects += 1
+                return responses.pop(0)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with patch("aiohttp.ClientSession", return_value=RetrySession()):
+                with patch("aiohttp.ClientTimeout"):
+                    first = await runner._run_agent_via_proxy(
+                        message="completion",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session-loss",
+                        durable_delivery_ids=[delivery_id],
+                    )
+                    second = await runner._run_agent_via_proxy(
+                        message="completion",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session-loss",
+                        durable_delivery_ids=[delivery_id],
+                    )
+
+        assert first["completed"] is False
+        assert second["completed"] is True
+        assert model_effects == 1
+        assert len(requests) == 2
+        assert {request[1]["Idempotency-Key"] for request in requests} == {
+            delivery_id
+        }
+
+    @pytest.mark.asyncio
+    async def test_durable_resume_does_not_send_later_turn_to_proxy(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+        runner = _make_runner()
+        delivery_id = "async-delegation:deleg_proxy_boundary"
+        durable_user = {
+            "role": "user",
+            "content": "durable completion",
+            "message_id": delivery_id,
+            "display_metadata": {
+                "hermes_completion_delivery_ids": [delivery_id]
+            },
+        }
+        later_turn = [
+            {"role": "user", "content": "unrelated request"},
+            {"role": "assistant", "content": "unrelated response"},
+        ]
+        # A late assistant message still linked to the durable delivery id
+        # (e.g. a delayed retry of the terminal). It arrives after the later
+        # user boundary and must not retroactively repair the ordering.
+        late_linked_terminal = {
+            "role": "assistant",
+            "content": "durable done (late)",
+            "display_metadata": {
+                "hermes_completion_delivery_ids": [delivery_id]
+            },
+        }
+        history = [durable_user, *later_turn, late_linked_terminal]
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                b'data: {"choices":[{"delta":{"content":"durable done"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent(
+                        message="durable completion",
+                        context_prompt="",
+                        history=history,
+                        source=_make_source(),
+                        session_id="proxy-boundary",
+                        durable_delivery_ids=[delivery_id],
+                    )
+
+        assert session.captured_url is None
+        assert session.captured_json is None
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["error"] == "durable_turn_conflict"
+        assert result["messages"] == history
 
 
     @pytest.mark.asyncio
