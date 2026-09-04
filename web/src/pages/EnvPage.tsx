@@ -641,7 +641,10 @@ export default function EnvPage() {
       };
       for (const cat of categories) {
         const hasEntries = Object.values(vars).some(
-          (info) => info.category === cat && !info.channel_managed,
+          (info) =>
+            info.category === cat &&
+            !info.channel_managed &&
+            (showAdvanced || !info.advanced),
         );
         if (hasEntries) {
           items.push({ id: `section-${cat}`, label: CATEGORY_LABELS[cat] ?? cat });
@@ -651,7 +654,7 @@ export default function EnvPage() {
       items.push({ id: "section-custom", label: t.env.customTitle });
     }
     return items;
-  }, [vars, t]);
+  }, [vars, showAdvanced, t]);
 
   useLayoutEffect(() => {
     if (!vars) {

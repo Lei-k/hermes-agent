@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, type ReactNode } from "react";
+import { act, isValidElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -34,6 +34,13 @@ const skillCredential: EnvVarInfo = {
   url: null,
 };
 
+const unsetSkillCredential: EnvVarInfo = {
+  ...skillCredential,
+  description: "Credential used by the bundled Linear skill",
+  is_set: false,
+  redacted_value: null,
+};
+
 let container: HTMLDivElement;
 let root: Root;
 
@@ -57,6 +64,19 @@ function buttonNamed(name: string): HTMLButtonElement {
   return button;
 }
 
+function reactText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") {
+    return String(node);
+  }
+  if (Array.isArray(node)) {
+    return node.map(reactText).join(" ");
+  }
+  if (isValidElement<{ children?: ReactNode }>(node)) {
+    return reactText(node.props.children);
+  }
+  return "";
+}
+
 beforeEach(() => {
   apiMocks.deleteEnvVar.mockReset();
   apiMocks.getEnvVars.mockReset();
@@ -64,7 +84,10 @@ beforeEach(() => {
   apiMocks.setEnvVar.mockReset();
   setAfterTitle.mockReset();
 
-  apiMocks.getEnvVars.mockResolvedValue({ NOTION_API_KEY: skillCredential });
+  apiMocks.getEnvVars.mockResolvedValue({
+    LINEAR_API_KEY: unsetSkillCredential,
+    NOTION_API_KEY: skillCredential,
+  });
   apiMocks.revealEnvVar.mockResolvedValue({
     key: "NOTION_API_KEY",
     value: "revealed-test-value",
@@ -88,11 +111,17 @@ describe("EnvPage bundled-skill credentials", () => {
     const skillSection = container.querySelector("#section-skill")!;
     expect(skillSection.textContent).toContain("Skills");
     expect(skillSection.textContent).toContain("NOTION_API_KEY");
+    expect(skillSection.textContent).not.toContain("LINEAR_API_KEY");
     expect(skillSection.textContent).toContain("noti...1234");
     expect(skillSection.textContent).not.toContain("revealed-test-value");
+    expect(apiMocks.revealEnvVar).not.toHaveBeenCalled();
+
+    await act(async () => buttonNamed("Show more").click());
+    expect(skillSection.textContent).toContain("LINEAR_API_KEY");
 
     await act(async () => buttonNamed("Hide Advanced").click());
     expect(container.querySelector("#section-skill")).toBeNull();
+    expect(reactText(setAfterTitle.mock.calls.at(-1)?.[0])).not.toContain("Skills");
 
     await act(async () => buttonNamed("Show Advanced").click());
     const revealButton = container.querySelector(
