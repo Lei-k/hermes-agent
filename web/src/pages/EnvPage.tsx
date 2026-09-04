@@ -5,6 +5,7 @@ import {
   ExternalLink,
   KeyRound,
   MessageSquare,
+  Package,
   Pencil,
   Plus,
   Save,
@@ -89,6 +90,7 @@ interface ProviderGroup {
 
 const CATEGORY_META_ICONS: Record<string, typeof KeyRound> = {
   provider: Zap,
+  skill: Package,
   tool: KeyRound,
   messaging: MessageSquare,
   setting: Settings,
@@ -630,8 +632,9 @@ export default function EnvPage() {
       { id: "section-providers", label: "Providers" },
     ];
     if (vars) {
-      const categories = ["tool", "messaging", "setting"];
+      const categories = ["skill", "tool", "messaging", "setting"];
       const CATEGORY_LABELS: Record<string, string> = {
+        skill: t.app.nav.skills,
         tool: "Tools",
         messaging: t.common.gateway ?? "Gateway",
         setting: "Settings",
@@ -839,6 +842,7 @@ export default function EnvPage() {
     // category here is trimmed down to cross-cutting gateway / API / proxy
     // settings and relabelled accordingly.
     const CATEGORY_META_LABELS: Record<string, string> = {
+      skill: t.app.nav.skills,
       tool: t.app.nav.keys,
       messaging: t.common.gateway ?? "Gateway",
       setting: t.app.nav.config,
@@ -848,7 +852,7 @@ export default function EnvPage() {
         t.common.gatewayHint ??
         "Messaging platforms, the API server and webhooks are configured on the Channels page. These are gateway-wide settings (proxy/relay mode and the global allowlist).",
     };
-    const otherCategories = ["tool", "messaging", "setting"];
+    const otherCategories = ["skill", "tool", "messaging", "setting"];
     const nonProvider = otherCategories.map((cat) => {
       const entries = Object.entries(vars).filter(
         ([, info]) =>
