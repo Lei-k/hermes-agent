@@ -285,7 +285,11 @@ _CONNECTION_MESSAGE_PATTERNS = (
 
 # SSL names keep provider-wrapped SSL errors (chain lost) as transport, not
 # unknown; OpenAI SDK errors are not subclasses of Python builtins.
-_TRANSPORT_ERROR_TYPES = frozenset({
+# Public: this is the canonical answer to "is this exception type a transport fault?".
+# ``agent/agent_runtime_helpers.py`` derives its client-rebuild gate from it so the two
+# cannot drift (they did: ``ReadError`` — the fleet's most common reset shape — was
+# classified as transport here but missing from the rebuild gate).
+TRANSPORT_ERROR_TYPES = frozenset({
     "ReadTimeout", "ConnectTimeout", "PoolTimeout", "ConnectError", "RemoteProtocolError",
     "ConnectionError", "ConnectionResetError", "ConnectionAbortedError", "BrokenPipeError",
     "TimeoutError", "ReadError", "ServerDisconnectedError",
@@ -571,7 +575,7 @@ def _by_transport(c: _Ctx) -> Optional[Verdict]:
     # network call): as ``unknown`` it would burn every retry instantly.
     if c.error_type == "RuntimeError" and "consecutive stale attempts" in msg and "aborting this call" in msg:
         return _v(_R.timeout, **_ABORT_FALLBACK)
-    transport = c.error_type in _TRANSPORT_ERROR_TYPES or isinstance(c.error, (TimeoutError, ConnectionError, OSError))
+    transport = c.error_type in TRANSPORT_ERROR_TYPES or isinstance(c.error, (TimeoutError, ConnectionError, OSError))
     return _V_TIMEOUT if transport else None
 
 

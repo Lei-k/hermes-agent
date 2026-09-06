@@ -255,8 +255,14 @@ def test_chat_gateways_drop_interrupt_sentinel(platform):
     assert _sanitize_gateway_final_response("local", sentinel) == sentinel
 
 
-def test_telegram_status_sanitizes_raw_provider_security_errors():
-    """Provider policy/security bodies should be replaced before chat delivery."""
+def test_telegram_status_never_delivers_raw_provider_security_errors():
+    """Provider policy/security bodies must not reach chat through the status lane.
+
+    The terminal failure envelope is delivered ONCE, as the turn's final response
+    (test_telegram_final_response_sanitizes_raw_provider_errors below) — the status
+    copy is dropped so the user does not get the same warning twice. Whatever the
+    delivery decision, the raw body/request id must never survive it.
+    """
     raw = (
         "❌ API failed after 3 retries — HTTP 400: request blocked because "
         "Operation contains cybersecurity risk. request_id=req_123"
@@ -264,11 +270,9 @@ def test_telegram_status_sanitizes_raw_provider_security_errors():
 
     sanitized = _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", raw)
 
-    assert sanitized is not None
-    assert "provider rejected" in sanitized.lower()
-    assert "cybersecurity risk" not in sanitized.lower()
-    assert "HTTP 400" not in sanitized
-    assert "req_123" not in sanitized
+    assert sanitized is None
+    # The programmatic surfaces still get the full diagnostic.
+    assert _prepare_gateway_status_message("local", "lifecycle", raw) == raw
 
 
 def test_telegram_final_response_sanitizes_raw_provider_errors():
