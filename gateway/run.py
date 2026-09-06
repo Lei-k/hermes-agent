@@ -451,6 +451,49 @@ _GATEWAY_CONNECTION_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# An ESTABLISHED connection died mid-transfer. Says nothing about whether the
+# endpoint is up — in the reported incident (2026-09-06) an earlier call in the
+# same turn had already been answered by it.
+_GATEWAY_CONNECTION_INTERRUPTED_RE = re.compile(
+    r"("
+    r"connection\s+reset"
+    r"|connection\s+aborted"
+    r"|errno\s+104"
+    r"|errno\s+103"
+    r"|broken\s+pipe"
+    r"|server\s+disconnected"
+    r"|peer\s+closed\s+connection"
+    r"|connection\s+was\s+closed"
+    r"|network\s+connection\s+lost"
+    r"|unexpected\s+eof"
+    r"|incomplete\s+chunked\s+read"
+    r"|response\s+ended\s+prematurely"
+    r"|socket\s+hang\s+up"
+    r"|(?:\w+\.)?remoteprotocolerror"
+    r"|(?:\w+\.)?readerror"
+    r")",
+    re.IGNORECASE,
+)
+
+# Nothing accepted the connection / no path to the host: "the endpoint is not
+# up" IS the diagnosis here, and this is the case the original wording (#86570)
+# was written for.
+_GATEWAY_ENDPOINT_UNREACHABLE_RE = re.compile(
+    r"("
+    r"connection\s+refused"
+    r"|actively\s+refused"
+    r"|winerror\s+10061"
+    r"|errno\s+111"
+    r"|no\s+route\s+to\s+host"
+    r"|network\s+is\s+unreachable"
+    r"|cannot\s+connect"
+    r"|failed\s+to\s+establish"
+    r"|could\s+not\s+connect"
+    r"|(?:\w+\.)?connect\s*(?:error|timeout)"
+    r")",
+    re.IGNORECASE,
+)
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -747,10 +790,36 @@ def _gateway_provider_error_reply(text: str) -> str:
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
         return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
-    if _GATEWAY_CONNECTION_ERROR_RE.search(text):
+    # The three connection causes are NOT interchangeable, and collapsing them
+    # is what made a mid-response TCP reset read as "your model server is down"
+    # (2026-09-06) while the same turn had already been answered by that
+    # endpoint. Ordered most-specific first; auth > policy > rate-limit >
+    # connection still holds above.
+    #   * interrupted — an established connection died mid-transfer. Whether the
+    #                   endpoint is up is unknown from this alone, so don't guess.
+    #   * unreachable — nothing accepted the connection at all; "not running /
+    #                   unreachable" is the actual diagnosis (#86570).
+    #   * ambiguous   — connection-shaped but the cause was flattened away (an
+    #                   SDK-wrapped ``APIConnectionError: Connection error.``
+    #                   keeps neither). Name both possibilities; assert neither.
+    if _GATEWAY_CONNECTION_INTERRUPTED_RE.search(text):
+        return (
+            "⚠️ The connection to the model provider was interrupted before the "
+            "reply arrived, and the retries hit the same problem. Please try "
+            "again; the transport details are in the gateway logs."
+        )
+    if _GATEWAY_ENDPOINT_UNREACHABLE_RE.search(text):
         return (
             "⚠️ The model server is not responding — it looks like the configured "
             "model endpoint is not running or is unreachable."
+        )
+    if _GATEWAY_CONNECTION_ERROR_RE.search(text):
+        return (
+            "⚠️ The model request could not be completed over the network after "
+            "retries — the connection was either never established or dropped "
+            "before the reply arrived. Please try again; if it keeps happening, "
+            "check that the configured model endpoint is reachable. Details are "
+            "in the gateway logs."
         )
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
@@ -870,7 +939,16 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         ):
             return None
     if _looks_like_gateway_provider_error(text):
-        return _gateway_provider_error_reply(text)
+        # The status and the turn's final response are the SAME failure: when the
+        # retry budget is spent the conversation loop emits the terminal envelope
+        # through ``status_callback`` AND returns it as ``final_response``, and
+        # ``_sanitize_gateway_final_response`` maps both onto the same reply here —
+        # so delivering this one posts the identical bubble twice (2026-09-06:
+        # three connection resets, one warning shown twice). Chat surfaces get the
+        # provider-failure category from the final response only; the raw
+        # diagnostic still goes to the logs and to the programmatic surfaces that
+        # returned above via ``_gateway_surface_passes_raw_text``.
+        return None
     return text
 
 

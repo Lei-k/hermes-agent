@@ -636,7 +636,7 @@ _TIMEOUT_MESSAGE_PATTERNS = [
 # Connection-establishment / DNS failure message patterns.  These surface
 # when the exception TYPE is generic (RuntimeError/Exception from a local
 # shim, MCP bridge, subprocess wrapper, or an SDK that re-raises without
-# chaining) so the _TRANSPORT_ERROR_TYPES check never fires, and the error
+# chaining) so the TRANSPORT_ERROR_TYPES check never fires, and the error
 # carries no HTTP status.  Without message-level matching they fall through
 # to FailoverReason.unknown, which misses the transport eager-fallback path
 # in the retry loop (unknown retries the same dead endpoint for the full
@@ -670,8 +670,16 @@ _CONNECTION_MESSAGE_PATTERNS = [
     "upstream connect error",
 ]
 
-# Transport error type names
-_TRANSPORT_ERROR_TYPES = frozenset({
+# Transport error type names.
+#
+# Public: this is the canonical answer to "is this exception type a transport
+# fault?". ``agent/agent_runtime_helpers.py`` derives its client-rebuild gate
+# from it so the two cannot drift — they did: ``ReadError`` (the shape a
+# mid-response ``[Errno 104] Connection reset by peer`` takes on routes that
+# read the response body themselves) is classified as transport here but was
+# missing from the hand-maintained rebuild gate, so every real reset skipped
+# the one-shot client rebuild.
+TRANSPORT_ERROR_TYPES = frozenset({
     "ReadTimeout", "ConnectTimeout", "PoolTimeout",
     "ConnectError", "RemoteProtocolError",
     "ConnectionError", "ConnectionResetError",
@@ -1190,7 +1198,7 @@ def classify_api_error(
 
     # ── 8. Transport / timeout heuristics ───────────────────────────
 
-    if error_type in _TRANSPORT_ERROR_TYPES or isinstance(error, (TimeoutError, ConnectionError, OSError)):
+    if error_type in TRANSPORT_ERROR_TYPES or isinstance(error, (TimeoutError, ConnectionError, OSError)):
         return _result(FailoverReason.timeout, retryable=True)
 
     # ── 9. Fallback: unknown ────────────────────────────────────────
@@ -1995,7 +2003,7 @@ def _classify_by_message(
 
     # Connection-establishment / DNS failure message patterns — same shim
     # problem as the timeout patterns above: the wrapping exception type is
-    # generic, so _TRANSPORT_ERROR_TYPES never matches and the error would
+    # generic, so TRANSPORT_ERROR_TYPES never matches and the error would
     # fall through to FailoverReason.unknown. Classified as timeout (the
     # transport bucket) so the retry loop's eager transport fallback and
     # client rebuild apply. Never routes to compression: a connection that
