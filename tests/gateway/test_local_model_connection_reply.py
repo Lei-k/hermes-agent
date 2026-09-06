@@ -11,8 +11,8 @@ from gateway.run import (
 
 class TestGatewayConnectionErrorReply:
     def test_connection_error_strings_produce_specific_reply(self):
+        """A connect that was REFUSED/unroutable is the local-endpoint-down case."""
         samples = [
-            "openai.APIConnectionError",
             "httpx.ConnectError: connection refused",
             "ConnectionError: [WinError 10061] No connection could be made",
             "Errno 111 Connection refused",
@@ -23,6 +23,21 @@ class TestGatewayConnectionErrorReply:
             reply = _gateway_provider_error_reply(text)
             assert "not responding" in reply.lower(), text
             assert "not running or is unreachable" in reply, text
+
+    def test_cause_free_connection_error_points_at_reachability_without_asserting_it(self):
+        """A bare ``APIConnectionError`` kept no cause: it may equally be a dropped reply.
+
+        Still a provider-error envelope, and still points the user at endpoint
+        reachability — but it no longer *states* that the endpoint is down (issue #15:
+        the same wording was shown for a mid-response TCP reset from a live endpoint).
+        """
+        text = "openai.APIConnectionError"
+
+        assert _looks_like_gateway_provider_error(text)
+        reply = _gateway_provider_error_reply(text)
+
+        assert "reachable" in reply.lower()
+        assert "not running or is unreachable" not in reply
 
     def test_broad_connection_phrases_still_map_once_classified(self):
         """Reply selector keeps the full phrase set; the gate does not."""

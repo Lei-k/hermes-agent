@@ -25,7 +25,7 @@ from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
     STATUS_EXHAUSTED, credential_pool_matches_provider, resolve_runtime_pool_key
 )
-from agent.error_classifier import FailoverReason
+from agent.error_classifier import TRANSPORT_ERROR_TYPES, FailoverReason
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 logger = logging.getLogger(__name__)
@@ -1195,10 +1195,16 @@ def restore_primary_runtime(agent) -> bool:
 
 
 # Transient transport failures worth one more attempt with a rebuilt client / connection pool.
-_TRANSIENT_TRANSPORT_ERRORS = frozenset({
-    "ReadTimeout", "ConnectTimeout", "PoolTimeout", "ConnectError", "RemoteProtocolError",
-    "APIConnectionError", "APITimeoutError",
-})
+# Derived from the canonical classifier so the gate cannot drift from "what counts as a
+# transport fault": a hand-maintained copy omitted ``ReadError`` — the shape a mid-response
+# ``[Errno 104] Connection reset by peer`` takes on routes that read the body themselves —
+# so the one connection the reset poisoned was never retired and every reset skipped the
+# rebuild. This widens WHICH failures get the single rebuild, not how many attempts anything
+# gets: recovery still fires at most once per API-call block, after the classifier already
+# called the error retryable and the normal retry budget is spent.
+# ``PoolTimeout`` stays a local addition: it is a fault of the pool this function rebuilds,
+# which is narrower than the classifier's question.
+_TRANSIENT_TRANSPORT_ERRORS = TRANSPORT_ERROR_TYPES | {"PoolTimeout"}
 _INLINE_REASONING_PATTERNS = tuple(
     re.compile(rf"<{tag}>(.*?)</{tag}>", re.DOTALL | re.IGNORECASE)
     for tag in ("think", "thinking", "thought", "reasoning", "REASONING_SCRATCHPAD")
