@@ -160,7 +160,7 @@ _SYNC_FALLBACK_NOTES = {
     "no_async": (
         "background=true is not available in this session — it cannot "
         "receive a detached subagent result after the turn ends (a "
-        "one-shot runner such as `hermes -z`, a cron job, a Kanban "
+        "delegated worker or one-shot runner such as `hermes -z`, a cron job, a Kanban "
         "worker, or a stateless HTTP endpoint). The subagent(s) ran SYNCHRONOUSLY and the result is included above."
     ),
     "at_capacity": (
@@ -186,6 +186,12 @@ def _resolve_async_wake_sid(origin_wake_sid: str) -> Optional[str]:
     wake. Uses the origin captured BEFORE child construction — HERMES_SESSION_ID here would be the subagent's internal
     id.
     """
+    from agent.delegation_context import is_delegated_child_context
+
+    # The worker's raw session id is not an API-server wake endpoint. Return the
+    # nested result in this worker's tool call instead of borrowing its chat route.
+    if is_delegated_child_context():
+        return None
     try:
         # Finite sessions cannot route a detached subagent result back to the agent after their turn/process
         # ends. This includes stateless HTTP requests (#10760) and one-shot Kanban workers (#63169). Fall
