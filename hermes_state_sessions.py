@@ -235,7 +235,9 @@ _INHERIT_PARENT_ROUTING_SQL = (
     "                           SELECT 1 FROM sessions p\n"
     "                           WHERE p.id = sessions.parent_session_id\n"
     "                             AND p.end_reason = 'compression'\n"
-    "                       )"
+    "                       )\n"
+    "                       AND COALESCE(json_extract(model_config, '$._delegate_from'), '') != parent_session_id\n"
+    "                       AND COALESCE(json_extract(model_config, '$._branched_from'), '') != parent_session_id"
 )
 
 

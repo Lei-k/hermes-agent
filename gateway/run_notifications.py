@@ -224,7 +224,11 @@ class GatewayNotificationsMixin:
                 session_entry.session_key, prior_session_id, target_session_id,
             )
         else:
-            switched = await self.async_session_store.switch_session(session_entry.session_key, target_session_id)
+            logger.warning(
+                "Internal completion for session %s does not own current route %s; dropping injection.",
+                target_session_id, prior_session_id,
+            )
+            return None
         if switched is None:
             logger.warning(
                 "Async-delegation completion could not bind routing key %s to "
