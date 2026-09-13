@@ -636,15 +636,14 @@ _PROVIDER_ERROR_REPLIES = (
     (_GATEWAY_PROVIDER_POLICY_RE, "⚠️ The model provider rejected the request. I kept the raw provider "
                                   "error out of chat; check gateway logs for details or try rephrasing."),
     (_GATEWAY_RATE_LIMIT_RE, "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."),
-    (_GATEWAY_CONNECTION_INTERRUPTED_RE, "⚠️ The connection to the model provider was interrupted before the "
-                                         "reply arrived, and the retries hit the same problem. Please try "
+    (_GATEWAY_CONNECTION_INTERRUPTED_RE, "⚠️ The connection to the model provider was interrupted. Please try "
                                          "again; the transport details are in the gateway logs."),
     (_GATEWAY_ENDPOINT_UNREACHABLE_RE, "⚠️ The model server is not responding — it looks like the configured "
                                        "model endpoint is not running or is unreachable."),
-    (_GATEWAY_CONNECTION_ERROR_RE, "⚠️ The model request could not be completed over the network after "
-                                   "retries — the connection was either never established or dropped before "
-                                   "the reply arrived. Please try again; if it keeps happening, check that the "
-                                   "configured model endpoint is reachable. Details are in the gateway logs."))
+    (_GATEWAY_CONNECTION_ERROR_RE, "⚠️ The model request could not be completed over the network — the "
+                                   "connection was either never established or was interrupted. Please try "
+                                   "again; if it keeps happening, check that the configured model endpoint "
+                                   "is reachable. Details are in the gateway logs."))
 
 
 def _gateway_provider_error_reply(text: str) -> str:
