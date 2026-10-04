@@ -1,7 +1,7 @@
 """Session/request route selection for the API-server adapter."""
 
 import logging
-from pathlib import Path
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("gateway.platforms.api_server")
@@ -10,24 +10,85 @@ logger = logging.getLogger("gateway.platforms.api_server")
 class SessionRuntimeMixin:
     """Keep explicit session choices separate from the last executed model."""
 
-    def _stored_session_model(self, session: Any) -> Optional[str]:
+    def _stored_session_route(self, session: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(session, dict):
             return None
         stored = session.get("model")
-        lock = self._parse_session_model_config(session.get("model_config")).get("browser_model_lock")
-        # API creation records explicit selections here (confirmed or not). The row's model
-        # alone is execution metadata and must not pin a previous default after a restart.
+        config = self._parse_session_model_config(session.get("model_config"))
+        lock = config.get("browser_model_lock")
         if isinstance(lock, dict):
-            # Confirmed locks are handled by the API prelude. An explicit one-turn request
-            # may bypass one without replacing it; don't reapply it as a raw stored model.
             if lock.get("confirmed"):
                 return None
-            stored = lock.get("model")
-        elif not self._resolve_route(stored):
-            return None
-        if not stored or stored == self._model_name:
-            return None
-        return stored
+            # A legacy model-only lock is as ambiguous as a provider-less /model pin.
+            if not lock.get("provider"):
+                return None
+            stored, config = lock.get("model"), lock
+            if lock.get("route_source") == "model_routes":
+                route = self._resolve_route(stored)
+                if not route:
+                    return None
+                # Keep credentials in configured routes, never in durable session metadata.
+                return {**route, **{k: lock[k] for k in ("provider", "base_url", "api_mode") if lock.get(k)}}
+        else:
+            # update_session_model writes an explicit route in both CLI/TUI shapes.
+            # Provider recovery idea from NousResearch/hermes-agent PR #123802.
+            nested = config.get("gateway_runtime")
+            if not config.get("provider") and isinstance(nested, dict):
+                config = nested
+        if stored and stored != self._model_name:
+            if config.get("provider"):
+                return {"model": stored, **{k: config[k] for k in ("provider", "base_url", "api_mode")
+                                            if config.get(k)}}
+            return self._resolve_route(stored)
+        return None
+
+    def _complete_session_selection(self, runtime_request: Dict[str, Any]) -> Dict[str, Any]:
+        """Capture route identity at selection time; credentials never enter the lock."""
+        from gateway.run import _load_gateway_config, _resolve_gateway_model, _resolve_runtime_agent_kwargs
+
+        requested = runtime_request.get("requested") or {}
+        route = runtime_request.get("route") or {}
+        model = requested.get("model") or _resolve_gateway_model()
+        provider = requested.get("provider") or route.get("provider")
+        if provider:
+            runtime = self._resolve_provider_runtime(provider, target_model=route.get("model") or model, required=False) or {}
+        else:
+            try:
+                runtime = _resolve_runtime_agent_kwargs()
+            except RuntimeError:
+                # Creating a session need not authenticate. Keep an explicit configured identity
+                # if credentials are unavailable; a provider-less legacy shape never pins a turn.
+                config = _load_gateway_config().get("model") or {}
+                runtime = config if isinstance(config, dict) else {}
+            provider = runtime.get("requested_provider") or runtime.get("provider")
+        if provider == "auto":
+            provider = runtime.get("provider")
+            if provider == "auto":
+                provider = None
+        lock = {
+            "model": model or "", "provider": provider or "",
+            "model_options": runtime_request.get("model_options") or {},
+            "route_source": runtime_request.get("route_source") or "",
+            "confirmed": bool(runtime_request.get("require_model_lock")), "updated_at": time.time()}
+        for key in ("base_url", "api_mode"):
+            value = route.get(key) or runtime.get(key)
+            if value:
+                lock[key] = value
+        return lock
+
+    def _persist_initial_session_selection(
+        self, session: Dict[str, Any], runtime_request: Dict[str, Any], session_key: Optional[str] = None,
+    ) -> None:
+        requested = runtime_request.get("requested") or {}
+        config = self._parse_session_model_config(session.get("model_config"))
+        if not (requested.get("model") or requested.get("provider")) or config.get("browser_model_lock"):
+            return
+        if self._stored_session_route(session):
+            return
+        if self._session_model_override_for(session_key or session["id"]):
+            return
+        lock = self._complete_session_selection(runtime_request)
+        self._ensure_session_db().patch_session_model_config(session["id"], {"browser_model_lock": lock})
 
     def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
         """The gateway's per-session ``/model`` override for *session_key*, if any — a
@@ -42,18 +103,10 @@ class SessionRuntimeMixin:
             store = getattr(runner, "session_store", None)
             if store is not None and store.lookup_by_session_key(session_key) is None:
                 from hermes_constants import get_hermes_home
-                # A native API caller may address a transcript without a gateway key.
-                # IDs can repeat across independent profile DBs; only its owning home may pin it.
-                request_home = Path(get_hermes_home()).resolve()
-                for entry in store.list_sessions():
-                    if entry.session_id != session_key:
-                        continue
-                    owner_home = store._profile_home_for_key(entry.session_key)
-                    if owner_home is None and not store._named_profile_for_key(entry.session_key):
-                        owner_home = store._routing_home
-                    if owner_home is not None and Path(owner_home).resolve() == request_home:
-                        session_key = entry.session_key
-                        break
+                from gateway.config import Platform
+                entry = store.lookup_by_session_id(session_key, owner_home=get_hermes_home(), platform=Platform.API_SERVER)
+                if entry is not None:
+                    session_key = entry.session_key
             try:
                 rehydrate = getattr(runner, "_rehydrate_session_model_override", None)
                 if callable(rehydrate):
@@ -93,12 +146,19 @@ class SessionRuntimeMixin:
             override_model = resolve_effective_model(session_override, None, model)
             # A rehydrated override without credentials must resolve on its OWN provider.
             # If unavailable, retain the complete default route and retry the durable pin next turn.
-            provider_runtime = session_override if session_override.get("api_key") else self._resolve_provider_runtime(
-                _clean_request_string(session_override.get("provider")) or current_provider,
-                target_model=override_model, required=False)
+            if session_override.get("api_key"):
+                from gateway.run import _credential_pool_for_provider
+                provider_runtime = dict(session_override)
+                if provider_runtime.get("credential_pool") is None:
+                    provider_runtime["credential_pool"] = _credential_pool_for_provider(session_override.get("provider"))
+            else:
+                provider_runtime = self._resolve_provider_runtime(
+                    _clean_request_string(session_override.get("provider")) or current_provider,
+                    target_model=override_model, required=False)
             if provider_runtime:
                 model = override_model
-                _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
+                runtime_kwargs.clear()
+                runtime_kwargs.update({k: v for k, v in provider_runtime.items() if k != "model"})
                 _apply_runtime_agent_overrides(runtime_kwargs, session_override)
             else:
                 logger.warning(
@@ -134,7 +194,7 @@ class SessionRuntimeMixin:
                 runtime_kwargs["provider"] = effective_provider
             model = effective_model
             # Per-route explicit transport secrets/base URLs win after provider resolution.
-            for key in ("api_key", "base_url"):
+            for key in ("api_key", "base_url", "api_mode"):
                 value = _clean_request_string(route_cfg.get(key))
                 if value:
                     runtime_kwargs[key] = value

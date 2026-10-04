@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 from pathlib import Path
+import sqlite3
 
 import pytest
 from aiohttp import web
@@ -46,10 +47,15 @@ def routing_env(tmp_path, monkeypatch):
     # Only credential access and inference are fake; config loading, provider resolution,
     # persistence, API prelude, executor and GatewayRunner rehydration are production code.
     monkeypatch.setattr(runtime_provider, "load_pool", Pool)
-    dispatches = []
+    class Dispatches(list):
+        runtimes = None
+
+    dispatches = Dispatches()
+    dispatches.runtimes = []
 
     class FakeAgent:
         def __init__(self, **kwargs):
+            self.runtime = kwargs
             self.model = kwargs["model"]
             self.provider = kwargs["provider"]
             self.base_url = kwargs["base_url"]
@@ -58,6 +64,7 @@ def routing_env(tmp_path, monkeypatch):
 
         def run_conversation(self, user_message, **kwargs):
             dispatches.append((self.model, self.provider, self.base_url))
+            dispatches.runtimes.append(self.runtime)
             self.db.ensure_session(self.session_id, "api_server", model=self.model)
             self.db.append_message(self.session_id, "user", user_message)
             self.db.append_message(self.session_id, "assistant", "synthetic answer")
@@ -116,6 +123,8 @@ async def test_api_resume_restart_uses_a_complete_route(routing_env, original, s
     restored = runner.session_store.lookup_by_session_key(key)
     assert restored.session_id == session_id
     assert "never-persist-me" not in (home / "sessions" / "sessions.json").read_text()
+    with sqlite3.connect(home / "state.db") as conn:
+        assert "never-persist-me" not in str(conn.execute("SELECT entry_json FROM gateway_routing").fetchall())
     app = web.Application()
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     expected_provider = original if selection == "pin" else current
@@ -187,6 +196,11 @@ async def test_api_explicit_selection_survives_restart_without_model_name_guessi
             payload = await response.json()
             assert response.status == 200, payload
             assert dispatches[-1] == (model, DIRECT, endpoint)
+            if selection == "transport_route":
+                response = await client.post(f"/api/sessions/{session_id}/chat", headers=headers,
+                    json={"message": "retain configured route on next turn"})
+                assert response.status == 200, await response.text()
+                assert dispatches[-1] == (model, DIRECT, endpoint)
     finally:
         runner.session_store.close_all_db_handles()
 
@@ -245,3 +259,139 @@ async def _profile_roundtrip(routing_env, monkeypatch, use_key):
     finally:
         store.close_all_db_handles()
         set_multiplex_active(was_multiplex)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("original", [CODEX, DIRECT])
+@pytest.mark.parametrize("selection", [
+    "create_model", "first_body", "legacy_lock", "legacy_confirmed", "legacy_alias", "one_turn",
+    "fork_lock", "fork_route", "fork_pin", "row_route", "gateway_route",
+])
+async def test_native_selection_is_a_durable_complete_route(routing_env, original, selection):
+    configure, restart, missing, dispatches, home = routing_env
+    configure(original)
+    runner, adapter = restart()
+    model = "arbitrary-selected-model"
+    endpoint = "https://selected-route.example/v1" if selection in {"row_route", "fork_route", "gateway_route"} else ROUTES[original][1]
+    sid = "selection-source"
+
+    def app_for(adapter):
+        app = web.Application()
+        app.router.add_post("/api/sessions", adapter._handle_create_session)
+        app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+        app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
+        return app
+
+    auth = {"Authorization": "Bearer synthetic-api-key"}
+    async with TestClient(TestServer(app_for(adapter))) as client:
+        body = {"id": sid}
+        if selection in {"create_model", "fork_lock", "one_turn"}:
+            body["model"] = model
+        response = await client.post("/api/sessions", headers=auth, json=body)
+        assert response.status == 201, await response.text()
+        if selection in {"legacy_lock", "legacy_confirmed", "legacy_alias"}:
+            adapter._session_db.update_session_runtime_lock(
+                sid, model="legacy-alias" if selection == "legacy_alias" else model,
+                confirmed=selection != "legacy_lock",
+                route_source="model_routes" if selection == "legacy_alias" else None)
+        elif selection in {"row_route", "fork_route", "gateway_route"}:
+            adapter._session_db.update_session_model(
+                sid, model, original, base_url=endpoint, api_mode="chat_completions")
+            if selection == "gateway_route":
+                adapter._session_db.patch_session_model_config(sid, {"provider": None, "base_url": None})
+        elif selection == "fork_pin":
+            entry = runner.session_store.get_or_create_session(
+                SessionSource(platform=Platform.API_SERVER, chat_id="fork-pin", chat_type="dm"))
+            runner.session_store.switch_session(entry.session_key, sid)
+            runner.session_store.set_model_override(entry.session_key, {
+                "model": model, "provider": original, "base_url": endpoint, "api_key": "never-persist-fork-key"})
+        if selection == "first_body":
+            response = await client.post(f"/api/sessions/{sid}/chat", headers=auth,
+                json={"message": "select on first turn", "model": model})
+            assert response.status == 200, await response.text()
+            assert dispatches[-1] == (model, original, ROUTES[original][1])
+        if selection == "one_turn":
+            other = DIRECT if original == CODEX else CODEX
+            response = await client.post(f"/api/sessions/{sid}/chat", headers=auth,
+                json={"message": "one turn switch", "model": ROUTES[other][0], "provider": other})
+            assert response.status == 200, await response.text()
+            assert dispatches[-1] == (ROUTES[other][0], other, ROUTES[other][1])
+        if selection.startswith("fork_"):
+            response = await client.post(f"/api/sessions/{sid}/fork", headers=auth, json={"id": "selection-fork"})
+            assert response.status == 201, await response.text()
+            sid = "selection-fork"
+            if selection == "fork_pin":
+                # A fork owns its copied selection even when the parent's gateway pin is reset.
+                runner.session_store.set_model_override(entry.session_key, None)
+    runner.session_store.close_all_db_handles()
+    current = DIRECT if original == CODEX else CODEX
+    configure(current)
+    runner, adapter = restart()
+    if selection == "legacy_alias":
+        adapter._model_routes["legacy-alias"] = {"model": model, "provider": original}
+    try:
+        async with TestClient(TestServer(app_for(adapter))) as client:
+            for _ in range(2):
+                response = await client.post(f"/api/sessions/{sid}/chat", headers=auth,
+                    json={"message": "resume selected route"})
+                assert response.status == 200, await response.text()
+                expected = (ROUTES[current][0], current, ROUTES[current][1]) if selection.startswith("legacy_") else (
+                    model, original, endpoint)
+                assert dispatches[-1] == expected
+                if selection in {"row_route", "fork_route", "gateway_route"}:
+                    assert dispatches.runtimes[-1]["api_mode"] == "chat_completions"
+        stored = adapter._session_db.get_session(sid)["model_config"] or ""
+        assert "synthetic-" + original not in stored
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["live_pin", "missing_route", "messaging_owner"])
+async def test_api_route_credentials_belong_to_the_selected_provider(routing_env, selection, monkeypatch):
+    configure, restart, missing, dispatches, home = routing_env
+    configure(DIRECT)
+    runner, adapter = restart()
+    platform = Platform.TELEGRAM if selection == "messaging_owner" else Platform.API_SERVER
+    entry = runner.session_store.get_or_create_session(
+        SessionSource(platform=platform, chat_id="route-owner", chat_type="dm"))
+    adapter._session_db.ensure_session(entry.session_id, "api_server")
+    runner._session_model_overrides[entry.session_key] = {
+        "model": ROUTES[CODEX][0], "provider": CODEX, "api_key": "synthetic-live-pin",
+        "base_url": ROUTES[CODEX][1], "api_mode": "codex_responses"}
+    auth = {"Authorization": "Bearer synthetic-api-key"}
+    body = {"message": "check route credentials"}
+    if selection == "live_pin":
+        auth["X-Hermes-Session-Key"] = entry.session_key
+        original_resolve = gateway_run._resolve_runtime_agent_kwargs
+
+        def default_with_command():
+            return {**original_resolve(), "command": "stale-default-command", "args": ["stale-default-arg"]}
+
+        monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", default_with_command)
+    elif selection == "missing_route":
+        missing.add(CODEX)
+        # A route can use an arbitrary model name; auth must fail before inference.
+        adapter._model_routes["unavailable-route"] = {
+            "model": "arbitrary-selected-model", "provider": CODEX, "base_url": ROUTES[CODEX][1]}
+        body["model"] = "unavailable-route"
+        runner._session_model_overrides.clear()
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(f"/api/sessions/{entry.session_id}/chat", headers=auth, json=body)
+            payload = await response.json()
+            assert response.status == 200, payload
+            if selection == "missing_route":
+                assert not dispatches
+                assert "authentication failed" in payload["message"]["content"].lower()
+            elif selection == "live_pin":
+                assert dispatches[-1] == (ROUTES[CODEX][0], CODEX, ROUTES[CODEX][1])
+                runtime = dispatches.runtimes[-1]
+                assert runtime["credential_pool"].provider == CODEX
+                assert not runtime.get("command") and not runtime.get("args")
+            else:
+                assert dispatches[-1] == (ROUTES[DIRECT][0], DIRECT, ROUTES[DIRECT][1])
+    finally:
+        runner.session_store.close_all_db_handles()

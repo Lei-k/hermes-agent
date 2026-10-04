@@ -2710,18 +2710,18 @@ class TestStoredSessionModelFilter:
 
     def test_virtual_model_is_filtered(self):
         adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({"model": adapter._model_name}) is None
+        assert adapter._stored_session_route({"model": adapter._model_name}) is None
 
     def test_real_model_passes_through(self):
         adapter = _make_routing_adapter({})
         session = {"model": "google/gemini-3.7-flash", "model_config": {
-            "browser_model_lock": {"model": "google/gemini-3.7-flash", "confirmed": False}}}
-        assert adapter._stored_session_model(session) == session["model"]
+            "browser_model_lock": {"model": "google/gemini-3.7-flash", "provider": "openrouter", "confirmed": False}}}
+        assert adapter._stored_session_route(session) == {"model": session["model"], "provider": "openrouter"}
 
     def test_missing_or_bad_shapes(self):
         adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({}) is None
-        assert adapter._stored_session_model(None) is None
+        assert adapter._stored_session_route({}) is None
+        assert adapter._stored_session_route(None) is None
 
 
 # ---------------------------------------------------------------------------

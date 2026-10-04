@@ -1293,13 +1293,29 @@ class SessionStore(
         entries.sort(key=lambda e: e.updated_at, reverse=True)
         return entries
 
-    def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
-        """Return the active session entry for a persisted session ID, if any."""
+    def lookup_by_session_id(
+        self, session_id: str, *, owner_home: Optional[Path] = None, platform: Optional[Platform] = None,
+    ) -> Optional[SessionEntry]:
+        """Return an active entry, optionally restricted to its owning home and surface.
+
+        Transcript IDs can collide across profile databases; callers without a gateway key
+        must supply ownership rather than adopting the first process-wide match.
+        """
         if not session_id:
             return None
         with self._lock:
             self._ensure_loaded_locked()
-            return next((e for e in self._entries.values() if e.session_id == session_id), None)
+            for entry in self._entries.values():
+                if entry.session_id != session_id or (platform and (not entry.origin or entry.origin.platform != platform)):
+                    continue
+                if owner_home is not None:
+                    home = self._profile_home_for_key(entry.session_key)
+                    if home is None and not self._named_profile_for_key(entry.session_key):
+                        home = self._routing_home
+                    if home is None or Path(home).resolve() != Path(owner_home).resolve():
+                        continue
+                return entry
+            return None
 
     def lookup_by_session_key(self, session_key: str) -> Optional[SessionEntry]:
         """Return the persisted routing entry for an exact session key."""

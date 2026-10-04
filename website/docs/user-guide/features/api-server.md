@@ -391,10 +391,19 @@ Precedence is deterministic:
 Native session-chat resumes keep explicit selections made at session creation,
 including their provider, and confirmed Browser model locks. A session's last
 executed model alone is history: without a selection, subsequent turns follow
-the current gateway defaults. A persisted `/model` pin without a provider also
+the current gateway defaults. A model supplied at creation or on the first native
+chat turn records an unconfirmed selection with its resolved provider and endpoint;
+later turns retain it, including after a restart or fork. An explicit body model/provider
+can switch one turn without replacing an existing selection. Complete routes saved by
+CLI/TUI `/model` switches also remain selections when resumed through the native API.
+A historical selection or persisted `/model` pin without a provider
 uses the complete default route; Hermes cannot recover its provider from the
 model name. If a `/model` pin's credentials are unavailable, that turn uses the
 complete default route and retains the pin for a later retry.
+Configured `model_routes` with a provider and no route API key require that provider's
+credentials; authentication failure stops inference before any default key is sent.
+Transcript-only requests adopt API-server pins only in the transcript's owning profile;
+they do not implicitly inherit messaging chats' `/model` pins.
 If a request sends a `provider` that conflicts with a configured `model_routes`
 alias, Hermes rejects the request with `400` instead of silently remixing route
 credentials with another provider.

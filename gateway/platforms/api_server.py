@@ -140,6 +140,7 @@ from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
+from gateway.platforms.api_server_runtime import SessionRuntimeMixin
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
     validate_media_delivery_path)
@@ -1196,9 +1197,6 @@ def _run_route_delegate(name: str):
     return _handler
 
 
-from gateway.platforms.api_server_runtime import SessionRuntimeMixin
-
-
 class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -2097,11 +2095,13 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
         if db is None:
             return False
         try:
+            lock = self._complete_session_selection(runtime_request)
             db.update_session_runtime_lock(
-                session_id, model=model or None, provider=provider or None,
+                session_id, model=lock["model"] or None, provider=lock["provider"] or None,
                 model_options=runtime_request.get("model_options") or {},
                 route_source=runtime_request.get("route_source") or "",
-                confirmed=bool(runtime_request.get("require_model_lock")))
+                confirmed=bool(runtime_request.get("require_model_lock")),
+                base_url=lock.get("base_url"), api_mode=lock.get("api_mode"))
             return True
         except Exception:
             logger.warning("[%s] failed to persist session runtime lock for %s", self.name, session_id, exc_info=True)
@@ -2128,12 +2128,17 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
         model, provider = self._requested_ids(lock)
         if not model and not provider:
             return None
+        if not provider:
+            return None  # historical model-only locks have no route identity
         if self._clean_runtime_id(lock.get("route_source"), max_len=64).lower() == "model_routes":
             route = self._resolve_route(model) if model else None
         else:
             route = {"model": model} if model else {}
             if provider:
                 route["provider"] = provider
+            for key in ("base_url", "api_mode"):
+                if lock.get(key):
+                    route[key] = lock[key]
         model_options = body.get("model_options")
         if not isinstance(model_options, dict):
             model_options = lock.get("model_options")
@@ -3077,12 +3082,9 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
         model_name = self._clean_runtime_id(requested.get("model")) or None
         model_config = None
         if requested.get("model") or requested.get("provider"):
-            model_config = {"browser_model_lock": {
-                "provider": requested.get("provider") or "", "model": requested.get("model") or "",
-                "model_options": runtime_request.get("model_options") or {},
-                "route_source": runtime_request.get("route_source") or "",
-                "confirmed": bool(runtime_request.get("require_model_lock")),
-                "updated_at": time.time()}}
+            lock = await asyncio.to_thread(self._complete_session_selection, runtime_request)
+            model_config = {"browser_model_lock": lock}
+            model_name = lock["model"] or None
         title = body.get("title")
 
         def _atomic(conn):
@@ -3253,10 +3255,30 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
         # ``_branched_from`` is the durable branch marker (same as CLI /branch): with the child created
         # first, the timestamp fallback in _BRANCH_CHILD_SQL (child.started_at >= parent.ended_at) no
         # longer holds, and an unmarked child would vanish from default session listings.
+        source_config = self._parse_session_model_config(source.get("model_config"))
+        fork_config = {key: source_config[key] for key in (
+            "model", "provider", "base_url", "api_mode")
+            if key in source_config}
+        for key in ("browser_model_lock", "gateway_runtime"):
+            selection = source_config.get(key)
+            if isinstance(selection, dict):
+                fork_config[key] = {name: selection[name] for name in (
+                    "model", "provider", "base_url", "api_mode", "model_options", "route_source", "confirmed", "updated_at")
+                    if name in selection}
+        fork_model = source.get("model")
+        source_override = await asyncio.to_thread(self._session_model_override_for, source_id)
+        source_lock = source_config.get("browser_model_lock")
+        if source_override and source_override.get("provider") and not (
+            isinstance(source_lock, dict) and source_lock.get("confirmed")):
+            fork_model = source_override.get("model") or fork_model
+            fork_config.pop("browser_model_lock", None)
+            override_route = {key: source_override.get(key) for key in ("provider", "base_url", "api_mode")}
+            fork_config.update(override_route, model=fork_model, gateway_runtime=override_route)
+        fork_config["_branched_from"] = source_id
         await asyncio.to_thread(
-            db.create_session, fork_id, "api_server", model=source.get("model"),
+            db.create_session, fork_id, "api_server", model=fork_model,
             system_prompt=source.get("system_prompt"), parent_session_id=source_id,
-            model_config={"_branched_from": source_id})
+            model_config=fork_config)
         await asyncio.to_thread(db.end_session, source_id, "branched")
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
@@ -3318,14 +3340,11 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
             if runtime_request.get("model_options"):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
-            stored_model = self._stored_session_model(session)
-            stored_route = self._resolve_route(stored_model)
-            if stored_model and stored_route is None:
-                lock = self._parse_session_model_config(session.get("model_config")).get("browser_model_lock")
-                if isinstance(lock, dict) and lock.get("provider"):
-                    stored_route = {"model": stored_model, "provider": lock["provider"]}
+            requested = runtime_request.get("requested") or {}
+            explicit_request = bool(requested.get("model") or requested.get("provider"))
+            stored_route = None if explicit_request else self._stored_session_route(session)
             route = stored_route or self._resolve_route(body.get("model"))
-            session_model = stored_model if (stored_model and stored_route is None) else None
+            session_model = None
             agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
             selection_error = self._request_route_conflict_error(
                 session_id=session_id, gateway_session_key=gateway_session_key,
@@ -3333,6 +3352,9 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
                 requested_provider=agent_overrides.get("requested_provider"), route=route)
             if selection_error:
                 return None, _error_response(selection_error, 400)
+            if explicit_request:
+                await asyncio.to_thread(
+                    self._persist_initial_session_selection, session, runtime_request, gateway_session_key)
         run_kwargs = dict(
             user_message=user_message, ephemeral_system_prompt=system_prompt, session_id=session_id,
             gateway_session_key=gateway_session_key, route=route, session_model=session_model,

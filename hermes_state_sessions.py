@@ -784,6 +784,7 @@ class SessionSessionsMixin:
         self, session_id: str, *, model: Optional[str] = None, provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None, route_source: Optional[str] = None,
         confirmed: bool = False,
+        base_url: Optional[str] = None, api_mode: Optional[str] = None,
     ) -> None:
         """Persist a Browser / API-client runtime lock into model_config (lineage markers survive).
         Route writers never touch the stored prompt; ``_stored_prompt_matches_runtime`` decides staleness."""
@@ -791,6 +792,9 @@ class SessionSessionsMixin:
             "provider": provider or "", "model": model or "", "model_options": model_options or {},
             "route_source": route_source or "", "confirmed": bool(confirmed), "updated_at": time.time(),
         }
+        for key, value in (("base_url", base_url), ("api_mode", api_mode)):
+            if value:
+                lock[key] = value
         self._write_model_config_patch(
             session_id, {"browser_model_lock": lock},
             """UPDATE sessions SET
