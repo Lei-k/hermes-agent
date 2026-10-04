@@ -1196,7 +1196,10 @@ def _run_route_delegate(name: str):
     return _handler
 
 
-class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+from gateway.platforms.api_server_runtime import SessionRuntimeMixin
+
+
+class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
     # Stateless request/response (``send()`` is a stub): async-delivery tools must not promise
@@ -1999,14 +2002,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Return the model_routes entry for *model_alias*, or None."""
         return self._model_routes.get(model_alias) if isinstance(model_alias, str) else None
 
-    def _stored_session_model(self, session: Any) -> Optional[str]:
-        """The model persisted on a session row, minus the virtual alias (replaying
-        "hermes-agent" upstream as a provider model id 400s)."""
-        stored = session.get("model") if isinstance(session, dict) else None
-        if not stored or stored == self._model_name:
-            return None
-        return stored
-
     @staticmethod
     def _clean_runtime_id(value: Any, *, max_len: int = 200) -> str:
         text = "" if value is None else str(value).strip()
@@ -2185,28 +2180,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return "api_server"
         return "hermes_browser" if text == "browser" else text
 
-    def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
-        """The gateway's per-session ``/model`` override for *session_key*, if any — a
-        user-issued ``/model`` always wins over static route config."""
-        if not session_key:
-            return None
-        try:
-            from gateway.run import _gateway_runner_ref
-            runner = _gateway_runner_ref()
-            if runner is None:
-                return None
-            try:
-                rehydrate = getattr(runner, "_rehydrate_session_model_override", None)
-                if callable(rehydrate):
-                    rehydrate(session_key)
-            except Exception:
-                logger.debug(
-                    "api_server failed to rehydrate session /model override for %s", session_key, exc_info=True)
-            override = runner._session_model_overrides.get(session_key)
-            return dict(override) if isinstance(override, dict) else None
-        except Exception:
-            return None
-
     def _request_route_conflict_error(
         self, *, session_id: Optional[str], gateway_session_key: Optional[str], requested_model: Optional[str],
         requested_provider: Optional[str], route: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -2291,75 +2264,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 self._last_resolved_model[_resolved_key] = model
             self._last_resolved_model["*"] = model
         return model
-
-    def _select_agent_runtime(
-        self, runtime_kwargs: Dict[str, Any], model: str, *, requested_model: Optional[str],
-        requested_provider: Optional[str], route: Optional[Dict[str, Any]], session_model: Optional[str],
-        confirmed_runtime_lock: bool, gateway_session_key: Optional[str], session_id: Optional[str]) -> tuple:
-        """Apply the model/provider precedence chain for one agent (mutates ``runtime_kwargs``):
-        confirmed Browser lock > session ``/model`` override > session-persisted model >
-        model_routes alias > per-request provider/model > global defaults. A confirmed lock
-        bypasses the override and fails closed if its provider cannot be resolved.
-        Returns ``(model, session_override, request_model, request_provider)``."""
-        request_model = _clean_request_string(requested_model)
-        request_provider = _clean_request_string(requested_provider)
-        route_cfg = route if isinstance(route, dict) else {}
-        route_model = _clean_request_string(route_cfg.get("model"))
-        route_provider = _clean_request_string(route_cfg.get("provider"))
-        session_key = gateway_session_key or session_id
-        session_row_model = _clean_request_string(session_model)
-        current_provider = _clean_request_string(runtime_kwargs.get("provider"))
-        session_override = None if confirmed_runtime_lock else self._session_model_override_for(session_key)
-        # Model-string precedence (override > session-persisted > global) is owned by
-        # hermes_cli.model_switch.resolve_effective_model.
-        from hermes_cli.model_switch import resolve_effective_model
-        if session_override:
-            model = resolve_effective_model(session_override, None, model)
-            self._apply_provider_runtime(
-                runtime_kwargs,
-                _clean_request_string(session_override.get("provider")) or current_provider,
-                target_model=model)
-            _apply_runtime_agent_overrides(runtime_kwargs, session_override)
-            if route or request_model or request_provider:
-                logger.debug(
-                    "api_server request selection skipped: session /model override wins for %s",
-                    session_key or "")
-        elif session_row_model and not confirmed_runtime_lock:
-            # A session-persisted raw model (no route alias) is a standing selection that pins
-            # this session's turns ahead of per-request body values.
-            self._apply_provider_runtime(
-                runtime_kwargs, current_provider, target_model=session_row_model)
-            model = resolve_effective_model(None, session_row_model, model)
-            if request_model or request_provider:
-                logger.debug(
-                    "api_server request selection skipped: session-persisted model wins for %s",
-                    session_key or "")
-        else:
-            # The request's ``model`` selected the route, so its value is the ALIAS — never a
-            # model name; a route with no ``model`` key keeps the global default.
-            effective_model = (route_model or model) if route is not None else (request_model or model)
-            effective_provider = request_provider or route_provider or current_provider
-            applied = False
-            if effective_provider and (bool(request_provider or route_provider) or effective_model != model):
-                # A confirmed Browser lock fails closed: never fall through to the previous
-                # global provider's credentials.
-                applied = self._apply_provider_runtime(
-                    runtime_kwargs, effective_provider, target_model=effective_model,
-                    required=bool(request_provider) or confirmed_runtime_lock)
-            if not applied and effective_provider and effective_provider != current_provider:
-                runtime_kwargs["provider"] = effective_provider
-            model = effective_model
-            # Per-route explicit transport secrets/base URLs win after provider resolution.
-            for key in ("api_key", "base_url"):
-                value = _clean_request_string(route_cfg.get(key))
-                if value:
-                    runtime_kwargs[key] = value
-            if route:
-                logger.debug(
-                    "api_server request selection applied: model=%s provider=%s route_provider=%s request_provider=%s",
-                    model, runtime_kwargs.get("provider"), route_provider or "", request_provider or "")
-        model = self._recover_or_record_model(model, runtime_kwargs, gateway_session_key)
-        return model, session_override, request_model, request_provider
 
     def _create_agent(
         self, ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
@@ -3416,6 +3320,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         else:
             stored_model = self._stored_session_model(session)
             stored_route = self._resolve_route(stored_model)
+            if stored_model and stored_route is None:
+                lock = self._parse_session_model_config(session.get("model_config")).get("browser_model_lock")
+                if isinstance(lock, dict) and lock.get("provider"):
+                    stored_route = {"model": stored_model, "provider": lock["provider"]}
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
             agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)

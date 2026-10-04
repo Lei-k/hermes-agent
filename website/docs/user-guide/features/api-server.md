@@ -388,6 +388,13 @@ Precedence is deterministic:
 4. Global gateway config / environment defaults
 
 `model_options` stays request-scoped regardless of which model/provider wins.
+Native session-chat resumes keep explicit selections made at session creation,
+including their provider, and confirmed Browser model locks. A session's last
+executed model alone is history: without a selection, subsequent turns follow
+the current gateway defaults. A persisted `/model` pin without a provider also
+uses the complete default route; Hermes cannot recover its provider from the
+model name. If a `/model` pin's credentials are unavailable, that turn uses the
+complete default route and retains the pin for a later retry.
 If a request sends a `provider` that conflicts with a configured `model_routes`
 alias, Hermes rejects the request with `400` instead of silently remixing route
 credentials with another provider.

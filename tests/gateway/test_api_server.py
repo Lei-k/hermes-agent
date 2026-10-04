@@ -2714,7 +2714,9 @@ class TestStoredSessionModelFilter:
 
     def test_real_model_passes_through(self):
         adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({"model": "google/gemini-3.7-flash"}) == "google/gemini-3.7-flash"
+        session = {"model": "google/gemini-3.7-flash", "model_config": {
+            "browser_model_lock": {"model": "google/gemini-3.7-flash", "confirmed": False}}}
+        assert adapter._stored_session_model(session) == session["model"]
 
     def test_missing_or_bad_shapes(self):
         adapter = _make_routing_adapter({})
