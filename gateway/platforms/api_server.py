@@ -2070,10 +2070,14 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
                 cls._clean_runtime_id(requested.get("provider"), max_len=80))
 
     def _runtime_lock_error(self, runtime_request: Dict[str, Any]) -> Optional["web.Response"]:
-        if not runtime_request.get("require_model_lock"):
-            return None
         model, provider = self._requested_ids(runtime_request.get("requested"))
         route = runtime_request.get("route")
+        if provider and not model and not route:
+            return _error_response(
+                "No coherent model route is available for the selected provider",
+                409, code="model_lock_unavailable")
+        if not runtime_request.get("require_model_lock"):
+            return None
         if not model and not provider:
             return _error_response(
                 "require_model_lock was set but no model/provider was provided", 400, code="missing_model")
@@ -2096,6 +2100,8 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
             return False
         try:
             lock = self._complete_session_selection(runtime_request)
+            if not lock:
+                return False
             db.update_session_runtime_lock(
                 session_id, model=lock["model"] or None, provider=lock["provider"] or None,
                 model_options=runtime_request.get("model_options") or {},
@@ -2128,10 +2134,15 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
         model, provider = self._requested_ids(lock)
         if not model and not provider:
             return None
-        if not provider:
-            return None  # historical model-only locks have no route identity
         if self._clean_runtime_id(lock.get("route_source"), max_len=64).lower() == "model_routes":
             route = self._resolve_route(model) if model else None
+        elif not provider:
+            from gateway.run import _resolve_gateway_model
+            route = None
+            if model == _resolve_gateway_model():
+                complete = self._complete_session_selection({})
+                if complete and complete.get("provider"):
+                    route = {k: complete[k] for k in ("model", "provider", "base_url", "api_mode") if complete.get(k)}
         else:
             route = {"model": model} if model else {}
             if provider:
@@ -3073,6 +3084,7 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
             return _error_response("system_prompt must be a string", 400, code="invalid_system_prompt")
         source = self._normalize_session_source(body.get("source") or "api_server")
         runtime_request = self._session_runtime_request_from_body(body)
+        await asyncio.to_thread(self._complete_provider_only_request, runtime_request)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
@@ -3322,6 +3334,7 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
         if system_prompt is not None and not isinstance(system_prompt, str):
             return None, _error_response("system_message must be a string", 400, code="invalid_system_message")
         runtime_request = self._effective_session_runtime_request(session=session, body=body)
+        await asyncio.to_thread(self._complete_provider_only_request, runtime_request)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return None, lock_error
@@ -3343,7 +3356,7 @@ class APIServerAdapter(SessionRuntimeMixin, OpenAICompatRoutesMixin, BasePlatfor
             requested = runtime_request.get("requested") or {}
             explicit_request = bool(requested.get("model") or requested.get("provider"))
             stored_route = None if explicit_request else self._stored_session_route(session)
-            route = stored_route or self._resolve_route(body.get("model"))
+            route = stored_route or runtime_request.get("route")
             session_model = None
             agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
             selection_error = self._request_route_conflict_error(

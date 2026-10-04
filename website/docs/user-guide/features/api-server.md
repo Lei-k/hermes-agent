@@ -396,9 +396,16 @@ chat turn records an unconfirmed selection with its resolved provider and endpoi
 later turns retain it, including after a restart or fork. An explicit body model/provider
 can switch one turn without replacing an existing selection. Complete routes saved by
 CLI/TUI `/model` switches also remain selections when resumed through the native API.
-A historical selection or persisted `/model` pin without a provider
-uses the complete default route; Hermes cannot recover its provider from the
-model name. If a `/model` pin's credentials are unavailable, that turn uses the
+Provider-only selections use that provider's own default model; if none is available,
+the selection returns HTTP 409 without persisting a lock or running inference.
+`POST /api/sessions` with a selection resolves provider credentials at creation.
+Legacy alias locks resolve from current `model_routes`, including locks without a
+stored provider. A confirmed lock whose alias was removed returns HTTP 409
+(`model_lock_unavailable`) without inference. Confirmed model-only legacy locks also
+return 409 unless their model equals the current default model, in which case they
+use the complete default route. Unconfirmed model-only locks and persisted `/model`
+pins without a provider follow the complete default route; Hermes cannot recover
+provider ownership from a model name. If a `/model` pin's credentials are unavailable, that turn uses the
 complete default route and retains the pin for a later retry.
 Configured `model_routes` with a provider and no route API key require that provider's
 credentials; authentication failure stops inference before any default key is sent.

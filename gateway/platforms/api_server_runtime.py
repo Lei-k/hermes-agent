@@ -19,9 +19,6 @@ class SessionRuntimeMixin:
         if isinstance(lock, dict):
             if lock.get("confirmed"):
                 return None
-            # A legacy model-only lock is as ambiguous as a provider-less /model pin.
-            if not lock.get("provider"):
-                return None
             stored, config = lock.get("model"), lock
             if lock.get("route_source") == "model_routes":
                 route = self._resolve_route(stored)
@@ -29,6 +26,9 @@ class SessionRuntimeMixin:
                     return None
                 # Keep credentials in configured routes, never in durable session metadata.
                 return {**route, **{k: lock[k] for k in ("provider", "base_url", "api_mode") if lock.get(k)}}
+            # Unconfirmed model-only locks cannot identify their historical provider.
+            if not lock.get("provider"):
+                return None
         else:
             # update_session_model writes an explicit route in both CLI/TUI shapes.
             # Provider recovery idea from NousResearch/hermes-agent PR #123802.
@@ -42,29 +42,53 @@ class SessionRuntimeMixin:
             return self._resolve_route(stored)
         return None
 
-    def _complete_session_selection(self, runtime_request: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _provider_selection_model(
+        provider: Optional[str], default_model: str, default_provider: Optional[str],
+        runtime: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if provider == default_provider:
+            return default_model
+        from hermes_cli.models import get_default_model_for_provider
+        return (runtime or {}).get("model") or get_default_model_for_provider(provider) or ""
+
+    def _complete_provider_only_request(self, runtime_request: Dict[str, Any]) -> None:
+        requested = runtime_request.get("requested") or {}
+        if requested.get("provider") and not requested.get("model"):
+            lock = self._complete_session_selection(runtime_request)
+            runtime_request["route"] = (
+                {k: lock[k] for k in ("model", "provider", "base_url", "api_mode") if lock.get(k)}
+                if lock else None)
+            runtime_request["route_source"] = "raw_request"
+
+    def _complete_session_selection(self, runtime_request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Capture route identity at selection time; credentials never enter the lock."""
         from gateway.run import _load_gateway_config, _resolve_gateway_model, _resolve_runtime_agent_kwargs
 
         requested = runtime_request.get("requested") or {}
         route = runtime_request.get("route") or {}
-        model = requested.get("model") or _resolve_gateway_model()
-        provider = requested.get("provider") or route.get("provider")
-        if provider:
-            runtime = self._resolve_provider_runtime(provider, target_model=route.get("model") or model, required=False) or {}
-        else:
-            try:
-                runtime = _resolve_runtime_agent_kwargs()
-            except RuntimeError:
-                # Creating a session need not authenticate. Keep an explicit configured identity
-                # if credentials are unavailable; a provider-less legacy shape never pins a turn.
-                config = _load_gateway_config().get("model") or {}
-                runtime = config if isinstance(config, dict) else {}
-            provider = runtime.get("requested_provider") or runtime.get("provider")
+        try:
+            default_runtime = _resolve_runtime_agent_kwargs()
+        except RuntimeError:
+            config = _load_gateway_config().get("model") or {}
+            default_runtime = config if isinstance(config, dict) else {}
+        default_provider = default_runtime.get("provider") or default_runtime.get("requested_provider")
+        provider = requested.get("provider") or route.get("provider") or default_provider
+        model = requested.get("model") or route.get("model")
+        if not model:
+            model = self._provider_selection_model(
+                provider, default_runtime.get("model") or _resolve_gateway_model(), default_provider)
+        runtime = (self._resolve_provider_runtime(provider, target_model=route.get("model") or model, required=False)
+                   or {}) if provider else default_runtime
         if provider == "auto":
             provider = runtime.get("provider")
             if provider == "auto":
                 provider = None
+        if not model:
+            model = self._provider_selection_model(
+                provider, _resolve_gateway_model(), default_provider, runtime)
+            if not model:
+                return None
         lock = {
             "model": model or "", "provider": provider or "",
             "model_options": runtime_request.get("model_options") or {},
@@ -88,7 +112,8 @@ class SessionRuntimeMixin:
         if self._session_model_override_for(session_key or session["id"]):
             return
         lock = self._complete_session_selection(runtime_request)
-        self._ensure_session_db().patch_session_model_config(session["id"], {"browser_model_lock": lock})
+        if lock:
+            self._ensure_session_db().patch_session_model_config(session["id"], {"browser_model_lock": lock})
 
     def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
         """The gateway's per-session ``/model`` override for *session_key*, if any — a
@@ -158,7 +183,10 @@ class SessionRuntimeMixin:
             if provider_runtime:
                 model = override_model
                 runtime_kwargs.clear()
-                runtime_kwargs.update({k: v for k, v in provider_runtime.items() if k != "model"})
+                runtime_kwargs.update({k: provider_runtime[k] for k in (
+                    "provider", "requested_provider", "api_key", "base_url", "api_mode",
+                    "max_tokens", "credential_pool", "request_overrides", "capabilities",
+                ) if k in provider_runtime})
                 _apply_runtime_agent_overrides(runtime_kwargs, session_override)
             else:
                 logger.warning(
@@ -179,9 +207,14 @@ class SessionRuntimeMixin:
                     session_key or "")
         else:
             # The request's ``model`` selected the route, so its value is the ALIAS — never a
-            # model name; a route with no ``model`` key keeps the global default.
+            # model name. Provider-only requests must select that provider's own model.
             effective_model = (route_model or model) if route is not None else (request_model or model)
             effective_provider = request_provider or route_provider or current_provider
+            if request_provider and not request_model and not route_model:
+                effective_model = self._provider_selection_model(request_provider, model, current_provider)
+                if not effective_model:
+                    from gateway.platforms.api_server import _ProviderAuthResolutionError
+                    raise _ProviderAuthResolutionError("No default model available for selected provider")
             applied = False
             if effective_provider and (bool(request_provider or route_provider) or effective_model != model):
                 # A confirmed Browser lock fails closed: never fall through to the previous

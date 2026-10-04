@@ -12,7 +12,7 @@ import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.session import SessionSource, SessionStore
-from hermes_cli import config as cli_config, runtime_provider
+from hermes_cli import config as cli_config, models, runtime_provider
 from providers import ProviderProfile, register_provider
 
 CODEX = "openai-codex"
@@ -29,6 +29,8 @@ def routing_env(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     register_provider(ProviderProfile(name=DIRECT, base_url=ROUTES[DIRECT][1],
                                       env_vars=("SYNTHETIC_CORE31_KEY",)))
+    monkeypatch.setitem(models._PROVIDER_MODELS, CODEX, [ROUTES[CODEX][0]])
+    monkeypatch.setitem(models._PROVIDER_MODELS, DIRECT, [ROUTES[DIRECT][0]])
     missing = set()
 
     class Pool:
@@ -266,12 +268,21 @@ async def _profile_roundtrip(routing_env, monkeypatch, use_key):
 @pytest.mark.parametrize("selection", [
     "create_model", "first_body", "legacy_lock", "legacy_confirmed", "legacy_alias", "one_turn",
     "fork_lock", "fork_route", "fork_pin", "row_route", "gateway_route",
+    "provider_only_create", "provider_only_first", "provider_only_confirmed", "provider_only_unknown", "provider_only_unknown_first", "provider_only_same",
+    "legacy_alias_unconfirmed", "legacy_alias_removed", "legacy_alias_removed_unconfirmed", "legacy_model_default", "legacy_model_default_fallback",
 ])
-async def test_native_selection_is_a_durable_complete_route(routing_env, original, selection):
+async def test_native_selection_is_a_durable_complete_route(routing_env, original, selection, monkeypatch):
     configure, restart, missing, dispatches, home = routing_env
-    configure(original)
+    current = DIRECT if original == CODEX else CODEX
+    configure(current if selection.startswith("provider_only") and selection != "provider_only_same" else original)
     runner, adapter = restart()
-    model = "arbitrary-selected-model"
+    model = ROUTES[original][0] if selection.startswith("provider_only") else "arbitrary-selected-model"
+    if selection == "provider_only_same":
+        monkeypatch.setitem(models._PROVIDER_MODELS, original, ["different-catalog-default"])
+    if selection in {"provider_only_unknown", "provider_only_unknown_first"}:
+        default_for_provider = models.get_default_model_for_provider
+        monkeypatch.setattr(models, "get_default_model_for_provider",
+            lambda provider: "" if provider == original else default_for_provider(provider))
     endpoint = "https://selected-route.example/v1" if selection in {"row_route", "fork_route", "gateway_route"} else ROUTES[original][1]
     sid = "selection-source"
 
@@ -287,13 +298,21 @@ async def test_native_selection_is_a_durable_complete_route(routing_env, origina
         body = {"id": sid}
         if selection in {"create_model", "fork_lock", "one_turn"}:
             body["model"] = model
+        if selection in {"provider_only_create", "provider_only_unknown", "provider_only_same"}:
+            body["provider"] = original
         response = await client.post("/api/sessions", headers=auth, json=body)
+        if selection == "provider_only_unknown":
+            assert response.status == 409, await response.text()
+            assert not dispatches
+            assert adapter._session_db.get_session(sid) is None
+            runner.session_store.close_all_db_handles()
+            return
         assert response.status == 201, await response.text()
-        if selection in {"legacy_lock", "legacy_confirmed", "legacy_alias"}:
+        if selection.startswith("legacy_"):
             adapter._session_db.update_session_runtime_lock(
-                sid, model="legacy-alias" if selection == "legacy_alias" else model,
-                confirmed=selection != "legacy_lock",
-                route_source="model_routes" if selection == "legacy_alias" else None)
+                sid, model="legacy-alias" if "alias" in selection else (ROUTES[current][0] if selection in {"legacy_model_default", "legacy_model_default_fallback"} else model),
+                confirmed=selection not in {"legacy_lock", "legacy_alias_unconfirmed", "legacy_alias_removed_unconfirmed"},
+                route_source="model_routes" if "alias" in selection else None)
         elif selection in {"row_route", "fork_route", "gateway_route"}:
             adapter._session_db.update_session_model(
                 sid, model, original, base_url=endpoint, api_mode="chat_completions")
@@ -305,6 +324,21 @@ async def test_native_selection_is_a_durable_complete_route(routing_env, origina
             runner.session_store.switch_session(entry.session_key, sid)
             runner.session_store.set_model_override(entry.session_key, {
                 "model": model, "provider": original, "base_url": endpoint, "api_key": "never-persist-fork-key"})
+        if selection in {"provider_only_first", "provider_only_confirmed", "provider_only_unknown_first"}:
+            response = await client.post(f"/api/sessions/{sid}/chat", headers=auth,
+                json={"message": "select provider on first turn", "provider": original,
+                      "require_model_lock": selection == "provider_only_confirmed"})
+            if selection == "provider_only_unknown_first":
+                assert response.status == 409, await response.text()
+                assert not dispatches
+                assert not adapter._session_db.get_session(sid)["model_config"]
+                runner.session_store.close_all_db_handles()
+                return
+            assert response.status == 200, await response.text()
+            assert dispatches[-1] == (model, original, ROUTES[original][1])
+        if selection.startswith("provider_only"):
+            lock = adapter._parse_session_model_config(adapter._session_db.get_session(sid)["model_config"])["browser_model_lock"]
+            assert (lock["model"], lock["provider"], lock["base_url"]) == (model, original, endpoint)
         if selection == "first_body":
             response = await client.post(f"/api/sessions/{sid}/chat", headers=auth,
                 json={"message": "select on first turn", "model": model})
@@ -325,17 +359,29 @@ async def test_native_selection_is_a_durable_complete_route(routing_env, origina
                 runner.session_store.set_model_override(entry.session_key, None)
     runner.session_store.close_all_db_handles()
     current = DIRECT if original == CODEX else CODEX
-    configure(current)
+    configure(original if selection.startswith("provider_only") and selection != "provider_only_same" else current)
+    if selection == "legacy_model_default_fallback":
+        missing.add(current)
+        with (home / "config.yaml").open("a") as cfg:
+            cfg.write(f"fallback_providers:\n  - provider: {original}\n    model: {ROUTES[original][0]}\n")
+        cli_config._LOAD_CONFIG_CACHE.clear()
+        cli_config._RAW_CONFIG_CACHE.clear()
+        model = ROUTES[original][0]
     runner, adapter = restart()
-    if selection == "legacy_alias":
+    if selection in {"legacy_alias", "legacy_alias_unconfirmed"}:
         adapter._model_routes["legacy-alias"] = {"model": model, "provider": original}
     try:
         async with TestClient(TestServer(app_for(adapter))) as client:
             for _ in range(2):
                 response = await client.post(f"/api/sessions/{sid}/chat", headers=auth,
                     json={"message": "resume selected route"})
+                if selection in {"legacy_confirmed", "legacy_alias_removed"}:
+                    assert response.status == 409, await response.text()
+                    assert (await response.json())["error"]["code"] == "model_lock_unavailable"
+                    assert not dispatches
+                    continue
                 assert response.status == 200, await response.text()
-                expected = (ROUTES[current][0], current, ROUTES[current][1]) if selection.startswith("legacy_") else (
+                expected = (ROUTES[current][0], current, ROUTES[current][1]) if selection in {"legacy_lock", "legacy_alias_removed_unconfirmed", "legacy_model_default"} else (
                     model, original, endpoint)
                 assert dispatches[-1] == expected
                 if selection in {"row_route", "fork_route", "gateway_route"}:
@@ -362,6 +408,7 @@ async def test_api_route_credentials_belong_to_the_selected_provider(routing_env
     auth = {"Authorization": "Bearer synthetic-api-key"}
     body = {"message": "check route credentials"}
     if selection == "live_pin":
+        runner._session_model_overrides[entry.session_key]["unexpected_agent_option"] = "must-not-spread"
         auth["X-Hermes-Session-Key"] = entry.session_key
         original_resolve = gateway_run._resolve_runtime_agent_kwargs
 
@@ -389,6 +436,7 @@ async def test_api_route_credentials_belong_to_the_selected_provider(routing_env
             elif selection == "live_pin":
                 assert dispatches[-1] == (ROUTES[CODEX][0], CODEX, ROUTES[CODEX][1])
                 runtime = dispatches.runtimes[-1]
+                assert "unexpected_agent_option" not in runtime
                 assert runtime["credential_pool"].provider == CODEX
                 assert not runtime.get("command") and not runtime.get("args")
             else:

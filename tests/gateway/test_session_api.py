@@ -1095,18 +1095,18 @@ async def test_unconfirmed_request_does_not_replace_confirmed_session_lock(adapt
 
 
 @pytest.mark.asyncio
-async def test_require_model_lock_hard_fails_when_global_default_would_be_used(adapter, session_db, monkeypatch):
+async def test_require_model_lock_hard_fails_without_a_provider_model(adapter, session_db, monkeypatch):
     session_id = session_db.create_session("lock-fail-session", "api_server")
     monkeypatch.setattr(adapter, "_model_name", "gpt-5.5")
     app = _create_session_app(adapter)
     with patch.object(adapter, "_resolve_route", return_value=None), patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
         async with TestClient(TestServer(app)) as cli:
-            # empty model + require_model_lock must not silently fall through
+            # A provider without a default model cannot borrow the global model.
             resp = await cli.post(
                 f"/api/sessions/{session_id}/chat",
                 json={
                     "message": "hello",
-                    "provider": "nous",
+                    "provider": "synthetic-no-default",
                     "model": "",
                     "require_model_lock": True,
                 },
