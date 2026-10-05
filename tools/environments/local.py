@@ -843,17 +843,30 @@ def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
 def _leader_is_ours(pgid, expected_start) -> bool:
     """The setsid group leader's PID == its PGID.  Confirm it is still the process we
     spawned before signalling the whole group, so a recycled PID/PGID can never take
-    down an unrelated process group (#43044).  When no start-time baseline was captured
-    (e.g. macOS, which has no /proc), fall back to the legacy best-effort behaviour
-    rather than refusing to kill."""
+    down an unrelated process group (#43044).  The baseline and the current reading
+    come from the same host at different times, so they go through the drift-tolerant
+    fingerprint comparator — same-host readings drift ~1 s on macOS (#117505), and
+    exact equality made the guard refuse to kill live, legitimately-owned groups.
+    When no baseline was captured, or the current reading is unreadable, keep the
+    legacy best-effort behaviour rather than refusing to kill: only a LIVE leader with
+    a different start time proves recycling."""
     if pgid is None:
         return False
     if expected_start is None:
         return True
-    from gateway.status import get_process_start_time
+    from gateway.status import get_process_start_time, start_time_fingerprints_match
     try:
-        return get_process_start_time(pgid) == expected_start
+        current = get_process_start_time(pgid)
     except Exception:  # noqa: BLE001 — the guard must never break signalling
+        return True
+    if current is None:
+        # Unreadable while alive: best effort. Gone: POSIX never reuses a PGID while any
+        # member of the group lives, so the group (if it still exists) is ours and its
+        # reparented grandchildren still need the signal; an empty group is just ESRCH.
+        return True
+    try:
+        return start_time_fingerprints_match(expected_start, current)
+    except (TypeError, ValueError):  # junk fingerprints: best-effort, never break signalling
         return True
 
 
@@ -1045,8 +1058,10 @@ class LocalEnvironment(BaseEnvironment):
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
-                # Record the group leader's start time so _kill_process can
-                # detect PID/PGID recycling before signalling the group (#43044).
+                # Record the group leader's start-time fingerprint so _kill_process can
+                # detect PID/PGID recycling before signalling the group (#43044). The
+                # psutil fallback in get_process_start_time captures a baseline on every
+                # platform, macOS included.
                 from gateway.status import get_process_start_time
                 proc._hermes_pgid_start = get_process_start_time(proc.pid)
         if stdin_data is not None:
@@ -1069,8 +1084,8 @@ class LocalEnvironment(BaseEnvironment):
             pgid = getattr(proc, "_hermes_pgid", None) or os.getpgid(proc.pid)
             # PID-reuse guard (#43044): never SIGKILL a group whose leader's start time
             # no longer matches the spawn-time baseline — the PGID may have been recycled
-            # onto an unrelated process group. Without a baseline (macOS, no /proc) keep
-            # the legacy best-effort behaviour.
+            # onto an unrelated process group. Comparison is drift-tolerant (#117505);
+            # without a baseline keep the legacy best-effort behaviour.
             if pgid != os.getpgrp() and _leader_is_ours(pgid, getattr(proc, "_hermes_pgid_start", None)):
                 os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX only (_IS_WINDOWS returned above)
         with contextlib.suppress(OSError):
