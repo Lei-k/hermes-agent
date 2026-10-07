@@ -160,6 +160,11 @@ class GatewayAgentCacheMixin:
             return
         if not persisted:
             return
+        if not persisted.get("provider"):
+            # A historical model-only pin has no route identity. After config changes it
+            # cannot safely inherit the current provider; retain it on disk and use defaults.
+            logger.debug("Persisted /model override for %s has no provider; using the default route", session_key)
+            return
         override: Dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
         provider = persisted.get("provider")
         from hermes_cli.runtime_provider import is_foreign_provider_endpoint
