@@ -160,9 +160,10 @@ class GatewayAgentCacheMixin:
             return
         if not persisted:
             return
-        if not persisted.get("provider"):
+        if not persisted.get("provider") and not _is_free_tier_pin(persisted):
             # A historical model-only pin has no route identity. After config changes it
             # cannot safely inherit the current provider; retain it on disk and use defaults.
+            # The /login free-tier pin is model-only by design and owns its route, so it restores.
             logger.debug("Persisted /model override for %s has no provider; using the default route", session_key)
             return
         override: dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
@@ -1152,3 +1153,12 @@ class GatewayAgentCacheMixin:
             self._spawn_release_thread(self._commit_then_release_soft, (agent, key), f"agent-cache-idle-{key[:24]}",
                                        inline_fallback=False, session_key=key)
         return len(to_evict)
+
+
+def _is_free_tier_pin(persisted: dict) -> bool:
+    """True for the model-only ``/login`` free-tier pin (``{"model": GUEST_MODEL}``)."""
+    try:
+        from hermes_cli.anon_auth import GUEST_MODEL
+    except Exception:
+        return False
+    return str(persisted.get("model") or "") == GUEST_MODEL

@@ -90,7 +90,6 @@ def routing_env(tmp_path, monkeypatch):
         monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
         adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "synthetic-api-key"}))
         adapter._session_db = store._db
-        adapter.gateway_runner = runner
         return runner, adapter
 
     return configure, restart, missing, dispatches, tmp_path
@@ -245,8 +244,10 @@ async def _profile_roundtrip(routing_env, monkeypatch, use_key):
         for name, home, provider in [("default", home_a, CODEX), ("b", home_b, DIRECT), ("default", home_a, CODEX)]:
             with gateway_run._profile_runtime_scope(home, prepared_secret_scope={}):
                 adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "synthetic-api-key"}))
-                adapter.gateway_runner = runner
                 adapter._session_db = store._db
+                # A multiplex gateway serving both profiles; prefix validation has its own tests, and a
+                # bound gateway_runner would route turns through SessionAuthority, not this fixture.
+                adapter._resolve_request_profile = lambda request: request.match_info.get("profile") or None
                 app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
                 app.router.add_post("/p/{profile}/api/sessions/{session_id}/chat", adapter._handle_session_chat)
                 headers = {"Authorization": "Bearer synthetic-api-key"}
