@@ -2710,16 +2710,18 @@ class TestStoredSessionModelFilter:
 
     def test_virtual_model_is_filtered(self):
         adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({"model": adapter._model_name}) is None
+        assert adapter._stored_session_route({"model": adapter._model_name}) is None
 
     def test_real_model_passes_through(self):
         adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({"model": "google/gemini-3.7-flash"}) == "google/gemini-3.7-flash"
+        session = {"model": "google/gemini-3.7-flash", "model_config": {
+            "browser_model_lock": {"model": "google/gemini-3.7-flash", "provider": "openrouter", "confirmed": False}}}
+        assert adapter._stored_session_route(session) == {"model": session["model"], "provider": "openrouter"}
 
     def test_missing_or_bad_shapes(self):
         adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({}) is None
-        assert adapter._stored_session_model(None) is None
+        assert adapter._stored_session_route({}) is None
+        assert adapter._stored_session_route(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2820,7 +2822,7 @@ class TestSessionDbOffEventLoop:
     async def test_create_session_with_provider_prefixed_virtual_alias_does_not_persist_it(self, auth_adapter):
         """A provider-prefixed echo of the virtual alias (e.g. a client that
         threads /v1/models' advertised id through a provider:: prefix) must
-        also be treated as "no model", not stored as a raw override.
+        resolves the provider's default model instead of storing the virtual alias.
 
         Regression: _handle_create_session used to re-derive its own `model`
         straight from the raw request body, bypassing the provider-prefix
@@ -2839,7 +2841,12 @@ class TestSessionDbOffEventLoop:
             )
             assert resp.status == 201
             data = await resp.json()
-            assert data["session"]["model"] is None
+            from hermes_cli.models import get_default_model_for_provider
+            assert data["session"]["model"] == get_default_model_for_provider("openrouter")
+            lock = auth_adapter._parse_session_model_config(
+                auth_adapter._ensure_session_db().get_session(data["session"]["id"])["model_config"])["browser_model_lock"]
+            assert lock["provider"] == "openrouter"
+            assert auth_adapter._model_name not in lock["model"]
 
 
 # ---------------------------------------------------------------------------
