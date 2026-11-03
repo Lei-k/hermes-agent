@@ -586,3 +586,25 @@ async def test_a_cancelled_attempt_never_claims_the_save(monkeypatch):
     attempt.cancelled = True
     with seen[0]["persist_guard"]() as may_persist:
         assert may_persist is False
+
+
+@pytest.mark.parametrize("model, restored", [(anon_auth.GUEST_MODEL, True), ("gpt-model-only-pin", False)])
+def test_provider_less_pin_restores_only_for_the_free_tier(monkeypatch, tmp_path, model, restored):
+    """A model-only /model pin has no route identity, so a restart must not pair it with whatever
+    provider is now the default (#31); the /login free-tier pin is model-only by design and restores."""
+    import hermes_state
+
+    def no_sqlite(**_kwargs):
+        raise RuntimeError("Exercise sessions.json persistence")
+
+    monkeypatch.setattr(hermes_state, "SessionDB", no_sqlite)
+    runner = _runner(monkeypatch)
+    store = SessionStore(sessions_dir=tmp_path, config=runner.config)
+    key = store.get_or_create_session(_source()).session_key
+    store.set_model_override(key, {"model": model})
+    rebuilt = _runner(monkeypatch)
+    rebuilt.session_store = SessionStore(sessions_dir=tmp_path, config=runner.config)
+    rebuilt._rehydrate_session_model_override(key)
+    assert (key in rebuilt._session_model_overrides) is restored
+    if restored:
+        assert rebuilt._session_model_overrides[key]["model"] == model
