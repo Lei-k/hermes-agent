@@ -57,6 +57,10 @@ Subagent reads require the current parent's live object ancestry, not merely equ
 session IDs; tails are bounded to 16 KiB. Missing or retired children return
 `available: false`. These are reads, not child steering or stop controls.
 
+`subagent.list` rows also carry `child_session_id`: the child's own stored session
+(`null` until it has one). A child's stored transcript, live or finished, is
+`session.transcript` with `subagent_id` (see [Gateway local sessions](./gateway-local-sessions.md)).
+
 Managed-worker policies return `unsupported_projection` for process/subagent reads:
 the owner's process-local registry cannot truthfully describe another interpreter.
 Control mutations (`session.control`), process mutations and subagent steering are
@@ -245,6 +249,35 @@ from the standalone protocol. Both parameters and successful results are checked
 ACP and finite CLI viewers detach with an explicit recovery notice if an accepted
 input becomes blocked behind an unknown execution. The accepted input remains
 queued: resolve the lost turn before continuing, rather than resending it.
+
+## Private control request workers
+
+The POSIX control listener owns two executors of its own: one for hosted producer
+requests and one for every other control request. A `hosted-producer` operation
+synchronously calls back through `hosted-attest` and `identify`, then waits for
+canonical session work on the owner loop, so its callbacks must not queue behind
+the producers waiting for them, and neither pool occupies the loop's default
+executor used by session work. Each pool's worker count is the
+`ThreadPoolExecutor` default and its queue is unbounded: enough simultaneous
+slow requests of one kind still queue behind each other; the split only removes
+the producer-to-callback dependency cycle. Request scheduling does not replace
+the existing peer and envelope checks.
+
+Stopping the listener cancels queued work and retires both pools. Already-running
+handlers retain their existing RPC deadlines; a restarted listener gets fresh
+pools. The Windows named-pipe listener retains its native worker lifecycle.
+
+Hosted-room recovery handles persisted stops before policy checkpoint work. An
+uncertain canonical attempt is resolved only for a saved Stop naming the exact
+task and execution generation, and only when the member reports it inactive.
+The member's canonical queue must acknowledge cancellation before the room task
+is marked cancelled; an inactive `unknown` attempt is not itself an acknowledgement.
+Resolving it reports the outcome the member's queue actually committed: when that
+owner still held the turn's finished answer (only its settlement write failed),
+the answer is committed and the room settles and publishes it once instead of
+cancelling the task. Discard of an indeterminate attempt follows the same rule.
+This preserves history and lets the next group input proceed without replaying
+the lost turn.
 
 ## Private native HTTP authentication
 
@@ -736,7 +769,6 @@ plugins/platforms/                  # plugin-packaged adapters (one dir each)
 ├── bluebubbles/adapter.py  # Apple iMessage via BlueBubbles macOS server
 ├── weixin/adapter.py       # Weixin (personal WeChat) via iLink Bot API
 ├── qqbot/                  # QQ Bot (Tencent QQ) via Official API v2
-├── yuanbao/adapter.py      # Yuanbao (Tencent) DM/group WebSocket
 └── …                       # google_chat, ntfy, photon, raft, simplex, …
 
 gateway/platforms/                  # core base + HTTP ingress adapters
